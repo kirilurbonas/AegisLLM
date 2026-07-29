@@ -1,0 +1,29 @@
+# App-of-apps: the single manually-applied object in the whole platform.
+# Everything else arrives through it, so the cluster's desired state has exactly
+# one entry point and one audit trail.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aegis-root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    # `make gitops` substitutes this with your `origin` remote at apply time, so
+    # the committed manifest stays fork-agnostic.
+    repoURL: AEGIS_REPO_URL
+    targetRevision: HEAD
+    path: gitops/apps
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: aegis
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,38 @@
+[project]
+name = "aegisllm"
+version = "0.1.0"
+description = "Secure LLM supply chain & runtime platform"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "huggingface-hub>=0.24",
+    "torch>=2.3",
+    "safetensors>=0.4.3",
+    "modelscan>=0.8",
+    "picklescan>=0.0.21",
+    "cyclonedx-python-lib>=7.6",
+    "model-signing>=1.0",
+]
+
+[project.scripts]
+aegis = "supplychain.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.2", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["supplychain"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

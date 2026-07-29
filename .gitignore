@@ -1,0 +1,13 @@
+artifacts/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+keys/
+kubeconfig*
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+infra/terraform/kind/aegis-config
