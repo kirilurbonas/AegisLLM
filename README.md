@@ -95,6 +95,12 @@ pytorch_model.safetensors
   ✓ blocked by rule: verifier-init-container-must-be-present
 ```
 
+The policies also have offline unit tests — `make test-policies` asserts, per
+rule, which example pods must pass and which must fail. Weakening a rule turns
+CI red. (Verified by weakening one on purpose: the suite caught it.) An admission
+gate that quietly stops enforcing is worse than none, because everyone goes on
+assuming it works.
+
 **The honest version of how this works**, because the obvious design doesn't:
 Kyverno's `verifyImages` reads image references out of the *pod spec*, and a
 model published as an OCI artifact never appears there. Kyverno cannot verify a

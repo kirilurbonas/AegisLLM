@@ -59,7 +59,7 @@ jobs:
           if-no-files-found: warn
 
   policies:
-    name: Kyverno policy validation
+    name: Kyverno policy tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +67,9 @@ jobs:
       - name: Install the Kyverno CLI
         uses: kyverno/action-install-cli@v0.2.0
 
-      - name: Validate policy syntax
-        run: kyverno version && for p in policies/*.yaml; do
-             echo "── $p"; kyverno validate "$p" || exit 1; done
+      - name: Test the admission policies
+        # Asserts behaviour, not syntax: every example pod is checked against
+        # every rule with an expected pass/fail. Weakening a rule turns this red
+        # -- an admission gate that quietly stops enforcing is worse than none,
+        # because everyone goes on assuming it works.
+        run: kyverno version && cd policies/tests && kyverno test .

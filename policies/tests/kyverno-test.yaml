@@ -1,0 +1,57 @@
+# Policy unit tests, run offline in CI by `kyverno test`.
+#
+# This asserts *behaviour*, not syntax: each example pod is checked against each
+# rule with an expected pass/fail. A policy that stops blocking what it is
+# supposed to block turns CI red, which is the point -- an admission gate that
+# silently stops enforcing is worse than no gate, because everyone assumes it is
+# still working.
+#
+# Only require-verified-model is covered here. verify-image-signatures has to
+# reach a registry to fetch signatures, so it cannot be exercised without a
+# cluster; `make demo-admission` covers it.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: aegis-admission-gate
+policies:
+  - ../require-verified-model.yaml
+resources:
+  - resources.yaml
+results:
+  # The compliant pod must satisfy every rule.
+  - policy: require-verified-model
+    rule: model-must-be-digest-pinned
+    resources: [model-server-compliant]
+    kind: Pod
+    result: pass
+  - policy: require-verified-model
+    rule: model-must-come-from-the-internal-registry
+    resources: [model-server-compliant]
+    kind: Pod
+    result: pass
+  - policy: require-verified-model
+    rule: verifier-init-container-must-be-present
+    resources: [model-server-compliant]
+    kind: Pod
+    result: pass
+
+  # A mutable tag is not provenance.
+  - policy: require-verified-model
+    rule: model-must-be-digest-pinned
+    resources: [model-server-unpinned]
+    kind: Pod
+    result: fail
+
+  # Weights straight from Hugging Face at runtime.
+  - policy: require-verified-model
+    rule: model-must-come-from-the-internal-registry
+    resources: [model-server-external]
+    kind: Pod
+    result: fail
+
+  # Valid reference, but nothing ever checks the signature.
+  - policy: require-verified-model
+    rule: verifier-init-container-must-be-present
+    resources: [model-server-no-verifier]
+    kind: Pod
+    result: fail

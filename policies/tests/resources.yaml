@@ -1,0 +1,140 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-compliant
+  namespace: aegis
+  annotations:
+    aegis.dev/model: aegis-registry:5000/models/all-minilm-l6-v2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+  labels:
+    app.kubernetes.io/name: model-server
+    app.kubernetes.io/part-of: aegisllm
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args:
+        - verify-ref
+        - $(AEGIS_MODEL)
+        - --dest=/models
+        - --cosign-key=/keys/cosign.pub
+        - --model-key=/keys/aegis-signing.pub
+      env:
+        - name: AEGIS_MODEL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['aegis.dev/model']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: keys
+          mountPath: /keys
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      resources:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits: { memory: 1Gi }
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      # Stands in for vLLM/Ollama until Pillar 3. What matters here is that it
+      # consumes weights it did not fetch and cannot modify.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "serving verified model from /models:"
+          ls -1 /models
+          exec sleep 3600
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { memory: 256Mi }
+  volumes:
+    - name: models
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: keys
+      secret:
+        secretName: aegis-public-keys
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-unpinned
+  namespace: aegis
+  annotations:
+    aegis.dev/model: aegis-registry:5000/models/all-minilm-l6-v2:latest
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args: ["verify-ref", "aegis-registry:5000/models/all-minilm-l6-v2:latest", "--dest=/models", "--cosign-key=/keys/cosign.pub", "--model-key=/keys/aegis-signing.pub"]
+      volumeMounts: [{name: models, mountPath: /models}]
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-external
+  namespace: aegis
+  annotations:
+    aegis.dev/model: huggingface.co/sentence-transformers/all-MiniLM-L6-v2@sha256:0000000000000000000000000000000000000000000000000000000000000000
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args: ["verify-ref", "--help"]
+      volumeMounts: [{name: models, mountPath: /models}]
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-no-verifier
+  namespace: aegis
+  annotations:
+    aegis.dev/model: aegis-registry:5000/models/all-minilm-l6-v2@sha256:1111111111111111111111111111111111111111111111111111111111111111
+spec:
+  restartPolicy: Never
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}
+---

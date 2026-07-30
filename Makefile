@@ -52,7 +52,7 @@ check: ## Verify the Docker daemon and required binaries are available
 
 .PHONY: tools
 tools: ## Install missing CLI dependencies via Homebrew
-	brew install kind kubectl helm terraform oras cosign
+	brew install kind kubectl helm terraform oras cosign kyverno
 
 .PHONY: install
 install: ## Sync the Python environment
@@ -85,6 +85,20 @@ test: ## Run the test suite (includes the malicious-pickle gate test)
 .PHONY: lint
 lint: ## Lint
 	uv run ruff check .
+
+.PHONY: test-policies
+test-policies: policies/tests/resources.yaml ## Kyverno policy unit tests (offline)
+	cd policies/tests && kyverno test .
+
+# Regenerated from examples/ so the tested manifests cannot drift away from the
+# ones the README shows and `make demo-admission` applies.
+policies/tests/resources.yaml: $(wildcard examples/*.yaml)
+	@ref="$(REGISTRY_IN)/models/all-minilm-l6-v2@sha256:$$(printf '1%.0s' {1..64})"; \
+	for f in compliant unpinned external no-verifier; do \
+		sed "s|AEGIS_MODEL_REF|$$ref|" examples/model-server-$$f.yaml | grep -v '^#'; \
+		echo "---"; \
+	done > $@
+	@echo "→ regenerated $@ from examples/"
 
 # --- pillar 0: cluster + gitops ----------------------------------------------
 
