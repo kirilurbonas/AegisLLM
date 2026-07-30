@@ -34,6 +34,13 @@ ModelOpt = typer.Option(None, "--model", "-m", help="Hugging Face model id")
 RevOpt = typer.Option(None, "--revision", "-r", help="branch, tag, or commit SHA")
 ModeOpt = typer.Option(None, "--mode", help="signing mode: 'key' or 'sigstore'")
 
+# Runtime-verifier options. No defaults: the verifier should never guess which
+# keys it is trusting.
+RefArg = typer.Argument(..., help="digest-pinned OCI reference")
+DestOpt = typer.Option(..., "--dest", help="where to place verified weights")
+CosignKeyOpt = typer.Option(..., "--cosign-key", help="public key for the OCI manifest")
+ModelKeyOpt = typer.Option(..., "--model-key", help="public key for the model bundle")
+
 
 @app.command("ingest")
 def cmd_ingest(model: str = ModelOpt, revision: str = RevOpt) -> None:
@@ -85,6 +92,25 @@ def cmd_verify(
     result = verify.run(_cfg(model, None, mode), local=local, repull=not no_pull)
     if result["verdict"] != "PASS":
         raise typer.Exit(code=1)
+
+
+@app.command("verify-ref")
+def cmd_verify_ref(
+    reference: str = RefArg,
+    dest: pathlib.Path = DestOpt,
+    cosign_pub: pathlib.Path = CosignKeyOpt,
+    model_pub: pathlib.Path = ModelKeyOpt,
+) -> None:
+    """Verify a published model from its reference alone, then unpack it.
+
+    This is what the verifier init container runs. It fails closed: any problem
+    exits non-zero and the serving pod never starts.
+    """
+    try:
+        verify.verify_ref(settings, reference, dest, cosign_pub, model_pub)
+    except (signing.SignatureError, RuntimeError) as exc:
+        stage("verify", f"REJECTED — {exc}", "fail")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("all")

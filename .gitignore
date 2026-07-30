@@ -11,3 +11,4 @@ kubeconfig*
 .terraform/
 .terraform.lock.hcl
 infra/terraform/kind/aegis-config
+bin/

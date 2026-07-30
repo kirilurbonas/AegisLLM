@@ -118,3 +118,20 @@ def test_verification_fails_against_a_foreign_key(secured, tmp_path):
     signing.ensure_keypair(foreign)
 
     assert verify.run(foreign, local=True)["verdict"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "reference,expected",
+    [
+        # The bug this guards: a registry port is a colon that is not a tag.
+        ("localhost:5001/models/x@sha256:abc", "localhost:5001/models/x"),
+        ("localhost:5001/models/x:v1", "localhost:5001/models/x"),
+        ("localhost:5001/models/x", "localhost:5001/models/x"),
+        ("ghcr.io/kiril/aegis:1.0", "ghcr.io/kiril/aegis"),
+        ("ghcr.io/kiril/aegis", "ghcr.io/kiril/aegis"),
+    ],
+)
+def test_repo_of_strips_tags_and_digests_not_ports(reference, expected):
+    from supplychain.registry import repo_of
+
+    assert repo_of(reference) == expected

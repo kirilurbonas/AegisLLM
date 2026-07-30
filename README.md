@@ -10,7 +10,7 @@ The software supply chain got secured over the last decade. The *model* supply c
 |---|---|---|
 | 1. Secure model supply chain | ingest → scan → safetensors → AIBOM → sign → OCI registry → verify | ✅ implemented |
 | 0. Foundation | Terraform `kind` cluster, Zot registry, ArgoCD GitOps | ✅ implemented |
-| 2. Hardened CI/CD + Kyverno admission gate | | 🚧 planned |
+| 2. Hardened CI/CD + admission gate | Trivy → cosign → SLSA provenance; Kyverno refuses unsigned images and unverified models | ✅ implemented |
 | 3. Runtime security gateway (FastAPI + guardrails) | | 🚧 planned |
 | 4. Continuous AI red-teaming (garak / promptfoo) | | 🚧 planned |
 | 5. Observability & governance | | 🚧 planned |
@@ -69,12 +69,51 @@ The gate is not decorative: `tests/test_scan.py` builds a genuinely malicious pi
 `__reduce__` invokes `os.system`, and asserts the scanner flags it and the pipeline refuses
 to continue.
 
+## Pillar 2: nothing unverified runs
+
+```bash
+make cluster && eval $(make kubeconfig)
+make supply-chain          # publish a signed model
+make verifier-image        # build + sign the verifier init container
+make kyverno keys-secret   # install Kyverno and the AegisLLM policies
+make demo-admission        # the gate, proven
+```
+
+`make demo-admission` output:
+
+```
+── compliant pod (must be ADMITTED and reach Running) ──
+→ the serving container sees:
+serving verified model from /models:
+aibom.cdx.json
+pytorch_model.safetensors
+── unpinned (must be REFUSED) ──
+  ✓ blocked by rule: model-must-be-digest-pinned
+── external (must be REFUSED) ──
+  ✓ blocked by rule: model-must-come-from-the-internal-registry
+── no-verifier (must be REFUSED) ──
+  ✓ blocked by rule: verifier-init-container-must-be-present
+```
+
+**The honest version of how this works**, because the obvious design doesn't:
+Kyverno's `verifyImages` reads image references out of the *pod spec*, and a
+model published as an OCI artifact never appears there. Kyverno cannot verify a
+model signature from an annotation, and anyone who says it can is describing
+something the tool does not do. So enforcement is split — Kyverno proves the pod
+is **shaped** so verification must happen (digest-pinned, internal registry,
+verifier present, image signature valid), and the verifier init container does
+the **cryptography** and fails closed. Neither half is sufficient alone.
+[docs/architecture.md](docs/architecture.md) explains why the split is forced
+rather than chosen, and records two version mismatches (cosign v3 ↔ Kyverno 1.18,
+oras 1.2 ↔ 1.3) that both fail in the misleading direction of looking like a
+missing signature.
+
 ## Threat coverage
 
 | OWASP LLM Top 10 (2025) | Control | Pillar |
 |---|---|---|
-| LLM03 Supply Chain | model scanning, signing, AIBOM, signed OCI registry | 1 ✅ |
-| LLM04 Data & Model Poisoning | provenance verification, safetensors, revision pinning | 1 ✅ |
+| LLM03 Supply Chain | model scanning, signing, AIBOM, signed OCI registry, admission gate | 1, 2 ✅ |
+| LLM04 Data & Model Poisoning | provenance verification, safetensors, revision pinning, admission gate | 1, 2 ✅ |
 | LLM01 Prompt Injection | input guardrails + red-team gate | 3, 4 🚧 |
 | LLM02 Sensitive Info Disclosure | output PII/secret scanning + audit logging | 3, 5 🚧 |
 | LLM05 Improper Output Handling | output guardrails, schema enforcement | 3 🚧 |
@@ -90,6 +129,8 @@ supplychain/     Pillar 1 — the model supply chain CLI (`aegis`)
 infra/terraform/ kind cluster, Zot OCI registry, ArgoCD
 gitops/          app-of-apps + workloads reconciled by ArgoCD
 policies/        Pillar 2 — Kyverno admission policies
+examples/        compliant and deliberately non-compliant model-serving pods
+.github/         CI (lint, test, scan gate) and release (Trivy, cosign, SLSA)
 gateway/         Pillar 3 — FastAPI inference gateway
 redteam/         Pillar 4 — garak / promptfoo suites
 ```

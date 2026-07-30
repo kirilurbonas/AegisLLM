@@ -1,0 +1,55 @@
+# "No unsigned code in production" -- the decade-old software supply chain rule,
+# applied here to the images that make up the platform itself.
+#
+# This one IS cryptographic at admission: the images are real container images in
+# the pod spec, so Kyverno can fetch each signature and verify it against our
+# public key before the pod is scheduled. Contrast with require-verified-model,
+# which cannot do this for model artifacts and explains why.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-aegis-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify container image signatures
+    policies.kyverno.io/category: AegisLLM / Supply Chain
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Every aegis-built image must carry a valid cosign signature made with the
+      platform signing key. Unsigned or foreign-signed images are refused.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-verifier-image
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aegis]
+      verifyImages:
+        # Only images we publish are in scope. Third-party images (the registry,
+        # base images) are governed by a separate allowlist rather than being
+        # expected to carry our signature.
+        - imageReferences:
+            - "*/aegis-verifier*"
+            - "*/aegisllm*"
+          # cosign v3 stores signatures as OCI 1.1 referrers rather than the
+          # legacy `sha256-<digest>.sig` tag. Without this, Kyverno looks for the
+          # old tag, gets a 404, and reports "no signatures found" -- which reads
+          # like a missing signature but is really a protocol mismatch.
+          cosignOCI11: true
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      REPLACED_AT_APPLY_TIME
+                      -----END PUBLIC KEY-----
+                    # No transparency log in an air-gapped cluster: there is no
+                    # route to one, so verification is against the key alone.
+                    ctlog:
+                      ignoreSCT: true
+                    rekor:
+                      ignoreTlog: true

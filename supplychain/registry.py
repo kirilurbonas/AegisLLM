@@ -17,8 +17,11 @@ admission policy will need to do in Pillar 2.
 from __future__ import annotations
 
 import json
+import os
+import pathlib
 import shutil
 import subprocess
+import tempfile
 from typing import Any
 
 from .config import Settings
@@ -43,6 +46,36 @@ def _tag(cfg: Settings) -> str:
     return read_report(cfg.reports_dir / "ingest.json")["resolved_sha"]
 
 
+def _discover(reference: str) -> dict[str, Any]:
+    return json.loads(_oras("discover", "--plain-http", "--format", "json", reference))
+
+
+def _referrers(discovered: dict[str, Any]) -> list[dict[str, Any]]:
+    """Referrer list, tolerating both `oras discover --format json` shapes.
+
+    oras 1.2.x returns them under "manifests"; 1.3.x renamed it to "referrers".
+    Reading only one key means the verifier silently finds no signature when the
+    binary version drifts -- and "no signature" is indistinguishable from an
+    unsigned artifact, so this fails *closed* in a way that looks like an attack.
+    Accept both.
+    """
+    return discovered.get("referrers") or discovered.get("manifests") or []
+
+
+def repo_of(reference: str) -> str:
+    """Strip any tag or digest, leaving <registry>/<repo>.
+
+    Naive rsplit(":") is wrong here: `localhost:5001/models/x` has a colon in the
+    registry *port*, so stripping the last colon-segment of an untagged reference
+    silently yields `localhost` and every subsequent pull fails obscurely.
+    """
+    reference = reference.split("@")[0]
+    host, _, path = reference.partition("/")
+    if not path:  # no repository path at all
+        return reference
+    return f"{host}/{path.rsplit(':', 1)[0]}" if ":" in path else reference
+
+
 def push(cfg: Settings) -> dict[str, Any]:
     ref = cfg.image_ref(_tag(cfg))
     files = sorted(
@@ -64,10 +97,138 @@ def push(cfg: Settings) -> dict[str, Any]:
         cwd=cfg.signature_path.parent,
     )
 
-    payload = {"reference": ref, "files": files, "artifact_type": ARTIFACT_TYPE}
+    digest = _resolve_digest(cfg, ref)
+    pinned = f"{repo_of(ref)}@{digest}"
+    cosign_signed = _cosign_sign(cfg, pinned)
+
+    payload = {
+        "reference": ref,
+        "digest": digest,
+        "pinned_reference": pinned,
+        "files": files,
+        "artifact_type": ARTIFACT_TYPE,
+        "cosign_signed": cosign_signed,
+    }
     write_report(cfg.reports_dir / "push.json", payload)
-    stage("push", f"published {ref}", "ok")
+    stage("push", f"published {payload['pinned_reference']}", "ok")
     return payload
+
+
+def _resolve_digest(cfg: Settings, ref: str) -> str:
+    """The manifest digest — the only form of reference a policy should trust.
+
+    A tag is a mutable pointer; a digest is the artifact itself.
+    """
+    return _discover(ref)["digest"]
+
+
+def ensure_cosign_key(cfg: Settings) -> None:
+    """Generate the cosign keypair if absent.
+
+    Empty passphrase: this is a local demo key. Production puts this in a KMS —
+    see the residual risk noted in docs/THREAT_MODEL.md.
+    """
+    if cfg.cosign_key.exists() and cfg.cosign_pub.exists():
+        return
+    cfg.cosign_key.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["cosign", "generate-key-pair", "--output-key-prefix", str(cfg.cosign_key.with_suffix(""))],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "COSIGN_PASSWORD": ""},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cosign generate-key-pair failed:\n{result.stderr.strip()}")
+
+
+def _cosign_sign(cfg: Settings, pinned_ref: str) -> bool:
+    """Sign the OCI manifest with cosign, in addition to the model-signing bundle.
+
+    Two signatures over the same artifact, answering different questions:
+
+      * the **model-signing bundle** covers the file bytes — "these are the exact
+        tensors that were scanned". Checked when the model is loaded.
+      * the **cosign signature** covers the OCI manifest — "this artifact was
+        published by us". Checked at *admission*, from the manifest alone,
+        without pulling gigabytes of weights.
+
+    Kyverno and the wider OCI ecosystem speak cosign; only this pipeline speaks
+    model-signing. Publishing both is what lets a cluster make a decision about a
+    model before it has downloaded it.
+    """
+    if shutil.which("cosign") is None:
+        stage("push", "cosign not installed — skipping OCI manifest signature", "info")
+        return False
+
+    ensure_cosign_key(cfg)
+    result = subprocess.run(
+        # --use-signing-config=false is required alongside --tlog-upload=false in
+        # cosign v3: the default signing config assumes a transparency log, which
+        # a local/air-gapped registry has no route to.
+        ["cosign", "sign", "--yes", "--tlog-upload=false", "--use-signing-config=false",
+         "--allow-insecure-registry", "--key", str(cfg.cosign_key), pinned_ref],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "COSIGN_PASSWORD": ""},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cosign sign failed:\n{result.stderr.strip()}")
+    stage("push", "cosign signature attached to the OCI manifest", "ok")
+    return True
+
+
+def cosign_verify(cfg: Settings, pinned_ref: str, public_key: pathlib.Path) -> None:
+    """Verify the OCI manifest signature. Raises on failure.
+
+    This is the cheap check: it reads the manifest and its signature only, so a
+    consumer can reject a model before downloading a single weight.
+    """
+    if shutil.which("cosign") is None:
+        raise RuntimeError("`cosign` is not installed — cannot verify the manifest")
+    result = subprocess.run(
+        ["cosign", "verify", "--key", str(public_key), "--allow-insecure-registry",
+         "--insecure-ignore-tlog=true", pinned_ref],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "COSIGN_PASSWORD": ""},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cosign could not verify {pinned_ref}:\n{result.stderr.strip()}"
+        )
+
+
+def pull_ref(pinned_ref: str, dest: pathlib.Path) -> pathlib.Path:
+    """Pull an arbitrary pinned reference plus its signature referrer.
+
+    Used at *runtime* by the verifier init container, which has no build reports
+    to consult — only the reference the pod asked for.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    _oras("pull", "--plain-http", pinned_ref, "-o", str(dest))
+
+    digest = next(
+        (
+            r["digest"]
+            for r in _referrers(_discover(pinned_ref))
+            if r.get("artifactType") == SIGNATURE_ARTIFACT_TYPE
+        ),
+        None,
+    )
+    if digest is None:
+        raise RuntimeError(f"{pinned_ref} has no signature referrer — refusing to trust it")
+
+    # A temp dir, not `<dest>.sig` beside it: the verifier runs with a read-only
+    # root filesystem, so the only writable places are the model volume and /tmp.
+    # The signature must also stay *outside* dest -- it covers that directory, so
+    # dropping it in would change what is being verified.
+    sig_dir = pathlib.Path(tempfile.mkdtemp(prefix="aegis-sig-"))
+    repo = repo_of(pinned_ref)
+    _oras("pull", "--plain-http", f"{repo}@{digest}", "-o", str(sig_dir))
+    return sig_dir
 
 
 def pull(cfg: Settings) -> dict[str, Any]:
@@ -80,11 +241,10 @@ def pull(cfg: Settings) -> dict[str, Any]:
     stage("pull", f"pulling {ref}")
     _oras("pull", "--plain-http", ref, "-o", str(cfg.pull_dir))
 
-    discovered = json.loads(_oras("discover", "--plain-http", "--format", "json", ref))
     digest = next(
         (
             r["digest"]
-            for r in discovered.get("referrers", [])
+            for r in _referrers(_discover(ref))
             if r.get("artifactType") == SIGNATURE_ARTIFACT_TYPE
         ),
         None,
@@ -98,7 +258,7 @@ def pull(cfg: Settings) -> dict[str, Any]:
     if sig_dir.exists():
         shutil.rmtree(sig_dir)
     sig_dir.mkdir(parents=True)
-    repo = ref.rsplit(":", 1)[0]
+    repo = repo_of(ref)
     _oras("pull", "--plain-http", f"{repo}@{digest}", "-o", str(sig_dir))
 
     return {

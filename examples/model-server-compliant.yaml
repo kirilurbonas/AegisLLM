@@ -1,0 +1,91 @@
+# A compliant model-serving pod.
+#
+# The shape here is the whole point of Pillar 2:
+#
+#   1. `aegis.dev/model` is digest-pinned and points at the internal registry.
+#   2. The `aegis-verify` init container pulls and cryptographically verifies the
+#      model into a shared emptyDir. If anything fails it exits non-zero and the
+#      serving container never starts -- fail closed.
+#   3. The serving container reads verified weights off that volume. It has no
+#      registry credentials and no network path to Hugging Face; it cannot fetch
+#      a model itself even if it wanted to.
+#
+# Substitute AEGIS_MODEL_REF at apply time -- see `make demo-admission`.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-compliant
+  namespace: aegis
+  annotations:
+    aegis.dev/model: AEGIS_MODEL_REF
+  labels:
+    app.kubernetes.io/name: model-server
+    app.kubernetes.io/part-of: aegisllm
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args:
+        - verify-ref
+        - $(AEGIS_MODEL)
+        - --dest=/models
+        - --cosign-key=/keys/cosign.pub
+        - --model-key=/keys/aegis-signing.pub
+      env:
+        - name: AEGIS_MODEL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['aegis.dev/model']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: keys
+          mountPath: /keys
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      resources:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits: { memory: 1Gi }
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      # Stands in for vLLM/Ollama until Pillar 3. What matters here is that it
+      # consumes weights it did not fetch and cannot modify.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "serving verified model from /models:"
+          ls -1 /models
+          exec sleep 3600
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { memory: 256Mi }
+  volumes:
+    - name: models
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: keys
+      secret:
+        secretName: aegis-public-keys

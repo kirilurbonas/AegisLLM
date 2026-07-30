@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     signing_mode: str = "key"
     private_key: pathlib.Path = REPO_ROOT / "keys" / "aegis-signing.key"
     public_key: pathlib.Path = REPO_ROOT / "keys" / "aegis-signing.pub"
+
+    # Separate from the model-signing key above: this one signs the OCI manifest
+    # so Kyverno can make an admission decision without pulling the weights.
+    cosign_key: pathlib.Path = REPO_ROOT / "keys" / "cosign.key"
+    cosign_pub: pathlib.Path = REPO_ROOT / "keys" / "cosign.pub"
     sigstore_staging: bool = False
 
     @property

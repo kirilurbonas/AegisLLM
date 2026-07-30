@@ -1,7 +1,8 @@
 # Threat model
 
-Scope of this document: the model supply chain (Pillar 1) and the platform
-foundation (Pillar 0), which are the parts that exist. Runtime threats are listed
+Scope of this document: the model supply chain (Pillar 1), the platform
+foundation (Pillar 0), and the CI/CD and admission gate (Pillar 2) — the parts
+that exist. Runtime threats are listed
 with their planned controls and marked as such — an unbuilt control is not a
 mitigation.
 
@@ -83,9 +84,40 @@ leaves the machine. `sigstore` mode removes the long-lived key entirely.
 *Residual risk:* in `key` mode the key sits on the build host. Production would
 move this to Vault or a KMS/HSM, or use sigstore keyless with workload identity.
 
-### T8 — Unsigned model reaching the cluster (**planned — Pillar 2**)
-Verification today is a pipeline step; nothing stops a human applying a manifest
-that mounts arbitrary weights. The Kyverno admission gate closes this.
+### T8 — Unsigned or substituted model reaching the cluster (**mitigated**)
+A human applies a manifest that mounts arbitrary weights, or points a serving pod
+at a model nobody scanned.
+
+*Controls, in two layers:*
+- **Kyverno at admission** — the model reference must be digest-pinned and from
+  the internal registry; the `aegis-verify` init container must be present; and
+  every aegis-built image must carry a valid cosign signature.
+- **The verifier init container at start-up** — cosign-verifies the OCI manifest,
+  then verifies the model-signing bundle over the actual bytes. Exits non-zero on
+  any failure, so the serving container never runs.
+
+*Evidence:* `make demo-admission` — a compliant pod reaches Running with verified
+weights; a tag-referenced model, a Hugging Face-sourced model, and a pod with no
+verifier are each refused, with the failing rule named.
+
+*Residual risk:* Kyverno cannot itself verify the model signature — an OCI model
+artifact never appears in the pod spec, so `verifyImages` cannot reach it. Layer 1
+proves the pod is *shaped* so that Layer 2 must run; Layer 2 does the
+cryptography. See docs/architecture.md for why this split is forced rather than
+chosen.
+
+### T8b — Tampering with the verifier itself (**partially mitigated**)
+If an attacker can substitute the verifier image, every downstream guarantee
+collapses.
+
+*Controls:* the verifier image is cosign-signed and Kyverno verifies that
+signature at admission — this check *is* cryptographic, because images do appear
+in the pod spec. The image runs unprivileged with a read-only root filesystem and
+all capabilities dropped, and carries neither torch nor modelscan.
+
+*Residual risk:* the policy matches the init container by name and image glob. A
+cluster-admin who can edit ClusterPolicies can remove the gate entirely; Kyverno
+RBAC is the control there, and it is out of scope for this build.
 
 ### T9 — Prompt injection, data leakage, unbounded consumption (**planned — Pillars 3–4**)
 No inference path exists yet, so these are out of scope for the current build.
@@ -94,8 +126,8 @@ No inference path exists yet, so these are out of scope for the current build.
 
 | Risk | Status | Control |
 |---|---|---|
-| LLM03 Supply Chain | ✅ | T1–T7 above |
-| LLM04 Data & Model Poisoning | ✅ | revision pinning, provenance verification, safetensors |
+| LLM03 Supply Chain | ✅ | T1–T7, plus the admission gate (T8) |
+| LLM04 Data & Model Poisoning | ✅ | revision pinning, provenance verification, safetensors, admission gate |
 | LLM01 Prompt Injection | 🚧 | input guardrails + red-team gate (Pillars 3–4) |
 | LLM02 Sensitive Info Disclosure | 🚧 | output scanning, audit log (Pillars 3, 5) |
 | LLM05 Improper Output Handling | 🚧 | output guardrails, schema enforcement (Pillar 3) |
@@ -109,7 +141,7 @@ No inference path exists yet, so these are out of scope for the current build.
 
 | Technique | Status | Control |
 |---|---|---|
-| AML.T0010 ML Supply Chain Compromise | ✅ | scan + sign + verify chain |
+| AML.T0010 ML Supply Chain Compromise | ✅ | scan + sign + verify chain + admission gate |
 | AML.T0018 Backdoor ML Model | ✅ partial | provenance pinning detects substitution; a backdoor trained into the *original* weights is not detectable here |
 | AML.T0019 Publish Poisoned Datasets | ❌ | upstream of this platform |
 | AML.T0051 LLM Prompt Injection | 🚧 | Pillars 3–4 |
@@ -124,5 +156,6 @@ Stated plainly, because a threat model that only lists wins is marketing:
   that revision — not *benignity*. Weight-level backdoor detection is an open
   research problem.
 - **`key` mode trusts a local key file.** See T7.
-- **Verification is not yet enforced at admission.** See T8.
+- **Kyverno does not verify the model signature itself.** It enforces the pod
+  shape; the init container does the cryptography. See T8.
 - **No runtime controls exist yet.** Pillars 3–5 are scaffolding, not mitigations.

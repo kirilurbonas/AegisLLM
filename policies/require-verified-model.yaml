@@ -1,0 +1,98 @@
+# Admission gate for model-serving workloads.
+#
+# ---------------------------------------------------------------------------
+# What this policy can and cannot do -- read this before trusting it.
+#
+# Kyverno's `verifyImages` extracts image references from the *pod spec*
+# (containers, initContainers, ephemeralContainers). A model published as an OCI
+# artifact is not a runnable image and never appears there, so Kyverno cannot be
+# pointed at it directly. Anyone claiming "Kyverno verifies my model signature"
+# from a pod annotation is describing something Kyverno does not do.
+#
+# So enforcement is split across two layers, and it is worth being precise about
+# which one proves what:
+#
+#   Layer 1 (this policy, structural, at admission)
+#     - the model reference is digest-pinned, not a mutable tag
+#     - it comes from the internal registry, not the public internet
+#     - the verifier init container is present, and its image is cosign-signed
+#     A pod that fails any of these never reaches the scheduler.
+#
+#   Layer 2 (the verifier init container, cryptographic, at start-up)
+#     - cosign-verifies the model's OCI manifest signature
+#     - verifies the model-signing bundle over the actual weight bytes
+#     It exits non-zero on any failure, so the serving container never runs.
+#
+# Layer 1 alone does not prove the model is authentic; it proves the pod is
+# *shaped* so that Layer 2 must run and must pass. Layer 2 does the cryptography.
+# Neither is sufficient alone: without Layer 1 a pod could simply omit the
+# verifier, and without Layer 2 nothing would check a signature at all.
+# ---------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-verified-model
+  annotations:
+    policies.kyverno.io/title: Require verified model provenance
+    policies.kyverno.io/category: AegisLLM / Supply Chain
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Any pod that declares it serves a model must reference that model by
+      digest from the internal registry, and must run the aegis verifier as an
+      init container so the signature is actually checked before serving starts.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: model-must-be-digest-pinned
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              annotations:
+                aegis.dev/model: "?*"
+      validate:
+        message: >-
+          The model reference must be digest-pinned (…@sha256:…). A tag can be
+          repointed at different weights after this policy approved it.
+        pattern:
+          metadata:
+            annotations:
+              aegis.dev/model: "*@sha256:*"
+
+    - name: model-must-come-from-the-internal-registry
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              annotations:
+                aegis.dev/model: "?*"
+      validate:
+        message: >-
+          Models must be served from the internal registry. Nothing at runtime
+          resolves huggingface.co -- that is the point of the air-gap boundary.
+        anyPattern:
+          - metadata:
+              annotations:
+                aegis.dev/model: "aegis-registry:5000/models/*"
+          - metadata:
+              annotations:
+                aegis.dev/model: "localhost:5001/models/*"
+
+    - name: verifier-init-container-must-be-present
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              annotations:
+                aegis.dev/model: "?*"
+      validate:
+        message: >-
+          A pod serving a model must run the `aegis-verify` init container. It is
+          what actually checks the signature, and it fails closed.
+        pattern:
+          spec:
+            initContainers:
+              - name: aegis-verify
+                image: "*aegis-verifier*"

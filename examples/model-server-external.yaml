@@ -1,0 +1,26 @@
+# VIOLATION 2: the model comes straight from Hugging Face.
+#
+# This is the failure mode the whole platform exists to prevent -- untrusted
+# third-party weights loaded at runtime, with no scan, no conversion, no
+# inventory and no signature. Nothing at runtime should resolve huggingface.co.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-external
+  namespace: aegis
+  annotations:
+    aegis.dev/model: huggingface.co/sentence-transformers/all-MiniLM-L6-v2@sha256:0000000000000000000000000000000000000000000000000000000000000000
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args: ["verify-ref", "--help"]
+      volumeMounts: [{name: models, mountPath: /models}]
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}

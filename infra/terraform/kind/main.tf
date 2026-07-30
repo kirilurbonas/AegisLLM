@@ -118,17 +118,27 @@ resource "null_resource" "registry_mirror" {
     registry = docker_container.registry.id
   }
 
+  # Two entries, because two different clients resolve these names:
+  #
+  #   localhost:5001      what a human on the host types. containerd rewrites it.
+  #   aegis-registry:5000 what in-cluster workloads must use -- Kyverno and the
+  #                       verifier init container run *inside* pods, where
+  #                       "localhost" is the pod itself, not the host.
+  #
+  # Both point at the same registry over plain HTTP.
   provisioner "local-exec" {
     command = <<-EOT
       set -euo pipefail
-      dir="/etc/containerd/certs.d/localhost:${var.registry_port}"
       for node in $(kind get nodes --name ${var.cluster_name}); do
-        docker exec "$node" mkdir -p "$dir"
-        docker exec -i "$node" sh -c "cat > $dir/hosts.toml" <<'TOML'
+        for host in "localhost:${var.registry_port}" "${var.registry_name}:5000"; do
+          dir="/etc/containerd/certs.d/$host"
+          docker exec "$node" mkdir -p "$dir"
+          docker exec -i "$node" sh -c "cat > $dir/hosts.toml" <<'TOML'
 [host."http://${var.registry_name}:5000"]
   capabilities = ["pull", "resolve"]
   skip_verify = true
 TOML
+        done
       done
     EOT
   }

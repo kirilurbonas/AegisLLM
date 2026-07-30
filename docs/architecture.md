@@ -11,9 +11,9 @@ scaffolded and planned.
 └───────────────────────────────────┬──────────────────────────────────────────┘
                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  PILLAR 2: HARDENED CI/CD + GITOPS            🚧 planned                      │
-│    GitHub Actions ─▶ SLSA provenance ─▶ Trivy ─▶ cosign ─▶ ArgoCD ─▶ K8s      │
-│    Kyverno admission: refuse any unsigned image OR unsigned model             │
+│  PILLAR 2: HARDENED CI/CD + ADMISSION GATE    ✅ built                        │
+│    GitHub Actions ─▶ Trivy ─▶ cosign keyless ─▶ SLSA provenance ─▶ GHCR       │
+│    Kyverno: refuse unsigned images, unpinned models, missing verifier         │
 └───────────────────────────────────┬──────────────────────────────────────────┘
                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -85,6 +85,71 @@ stuck; the default here is `key`, with `--mode sigstore` for the public demo.
 baking it in means a verifier can fetch and check it independently, without
 pulling gigabytes of weights first. That is precisely the shape a Kyverno
 admission policy needs in Pillar 2.
+
+## Pillar 2 — design notes
+
+### The hard problem: Kyverno cannot verify a model signature
+
+This is the wrinkle worth understanding, because the obvious design does not work.
+
+Kyverno's `verifyImages` extracts image references from the **pod spec** —
+containers, initContainers, ephemeralContainers. A model published as an OCI
+artifact is not a runnable image and never appears there. You can put the model
+reference in an annotation, but Kyverno will not verify an annotation's
+signature. Anyone claiming "Kyverno verifies my model signature from a pod
+annotation" is describing something the tool does not do.
+
+So enforcement is split, and it is worth being precise about what each half
+proves:
+
+| | Layer 1 — Kyverno, at admission | Layer 2 — verifier init container, at start-up |
+|---|---|---|
+| **Checks** | structure: digest-pinned, internal registry, verifier present, image signature valid | cryptography: manifest signature, then the model-signing bundle over the weight bytes |
+| **Proves** | the pod is *shaped* so verification must happen | the weights are authentic and unmodified |
+| **Fails by** | refusing admission | exiting non-zero, so the serving container never starts |
+
+Neither is sufficient alone. Without Layer 1 a pod could simply omit the
+verifier; without Layer 2 nothing would check a signature at all. The container
+*image* signature check in Layer 1 **is** genuinely cryptographic — images do
+appear in the pod spec — and it is what makes trusting the Layer 2 verifier
+binary reasonable.
+
+### Two signatures over the same model, deliberately
+
+- **model-signing bundle** — covers the file bytes. Answers "are these the exact
+  tensors that were scanned?" Checked when the model is loaded.
+- **cosign signature on the OCI manifest** — answers "did we publish this?"
+  Checkable from the manifest alone, without pulling gigabytes of weights.
+
+The second exists because the first is unreadable to everything except this
+pipeline. Kyverno, and the OCI ecosystem generally, speak cosign.
+
+### Interoperability constraints found the hard way
+
+Two version mismatches cost real debugging time and are worth recording, because
+both fail in the same misleading direction — they look like a missing signature
+when they are a protocol difference:
+
+- **cosign v3 vs Kyverno 1.18.** cosign v3 publishes signatures as OCI 1.1
+  referrers carrying a sigstore bundle. Kyverno 1.18 reads the legacy
+  `sha256-<digest>.sig` tag, and its `cosignOCI11: true` option does not
+  understand the new bundle artifact type either. `--registry-referrers-mode=legacy`
+  does not restore the old behaviour. Container images are therefore signed with
+  a pinned **cosign v2.4.3** (`make verifier-image` fetches it); model artifacts
+  still use the system cosign, because only our own verifier reads those.
+- **oras 1.2 vs 1.3.** `oras discover --format json` returns referrers under
+  `manifests` in 1.2.x and `referrers` in 1.3.x. Reading only one key makes the
+  verifier silently find no signature — which is indistinguishable from an
+  unsigned artifact, so it fails closed *as though under attack*. The code
+  accepts both keys.
+
+### Registry naming
+
+`localhost:5001` is the host-side view. In-cluster workloads must use
+`aegis-registry:5000`, because inside a pod `localhost` is the pod itself — this
+bit both Kyverno and the verifier init container. containerd carries a
+`hosts.toml` for both names so either resolves to the same registry over plain
+HTTP.
 
 ## Data flow
 

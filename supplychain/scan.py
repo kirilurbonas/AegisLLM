@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from modelscan.modelscan import ModelScan
 from picklescan.scanner import scan_directory_path
 
 from .config import Settings
@@ -38,6 +37,10 @@ BENIGN_SUFFIXES = {".json", ".txt", ".md", ".model", ".safetensors"}
 
 
 def _run_modelscan(root) -> dict[str, Any]:
+    # Imported here, not at module scope: scanning is a build-time concern, and
+    # the verifier image ships without modelscan. See convert._torch().
+    from modelscan.modelscan import ModelScan
+
     report = ModelScan().scan(root)
     summary = report["summary"]
     return {

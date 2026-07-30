@@ -1,0 +1,26 @@
+# VIOLATION 1: the model is referenced by tag, not digest.
+#
+# A tag is a mutable pointer. Approve `:v1` today, and whoever can push to the
+# registry can repoint it at different weights tomorrow -- with the pod spec, and
+# the audit trail, completely unchanged. Kyverno rejects this at admission.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-unpinned
+  namespace: aegis
+  annotations:
+    aegis.dev/model: aegis-registry:5000/models/all-minilm-l6-v2:latest
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      args: ["verify-ref", "aegis-registry:5000/models/all-minilm-l6-v2:latest", "--dest=/models", "--cosign-key=/keys/cosign.pub", "--model-key=/keys/aegis-signing.pub"]
+      volumeMounts: [{name: models, mountPath: /models}]
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}

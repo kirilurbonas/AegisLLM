@@ -14,18 +14,23 @@ dependencies = [
     { name = "cyclonedx-python-lib" },
     { name = "huggingface-hub" },
     { name = "model-signing" },
-    { name = "modelscan" },
     { name = "picklescan" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "rich" },
     { name = "safetensors" },
-    { name = "torch" },
     { name = "typer" },
+]
+
+[package.optional-dependencies]
+build = [
+    { name = "modelscan" },
+    { name = "torch" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "aegisllm", extra = ["build"] },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -35,18 +40,20 @@ requires-dist = [
     { name = "cyclonedx-python-lib", specifier = ">=7.6" },
     { name = "huggingface-hub", specifier = ">=0.24" },
     { name = "model-signing", specifier = ">=1.0" },
-    { name = "modelscan", specifier = ">=0.8" },
+    { name = "modelscan", marker = "extra == 'build'", specifier = ">=0.8" },
     { name = "picklescan", specifier = ">=0.0.21" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "rich", specifier = ">=13.7" },
     { name = "safetensors", specifier = ">=0.4.3" },
-    { name = "torch", specifier = ">=2.3" },
+    { name = "torch", marker = "extra == 'build'", specifier = ">=2.3" },
     { name = "typer", specifier = ">=0.12" },
 ]
+provides-extras = ["build"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aegisllm", extras = ["build"] },
     { name = "pytest", specifier = ">=8.2" },
     { name = "ruff", specifier = ">=0.5" },
 ]

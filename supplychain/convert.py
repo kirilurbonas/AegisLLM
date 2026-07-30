@@ -16,10 +16,6 @@ import pathlib
 import shutil
 from typing import Any
 
-import torch
-from safetensors.torch import load_file as load_safetensors
-from safetensors.torch import save_file
-
 from .config import Settings
 from .ingest import staged_root
 from .report import hash_manifest, read_report, stage, write_report
@@ -29,7 +25,25 @@ PICKLE_SUFFIXES = {".bin", ".pt", ".pth", ".ckpt"}
 METADATA_SUFFIXES = {".json", ".txt", ".md", ".model"}
 
 
-def _load_checkpoint(path: pathlib.Path) -> dict[str, torch.Tensor]:
+def _torch():
+    """Import torch on demand.
+
+    Conversion needs torch; *verification* does not. The verifier runs as an init
+    container on every model-serving pod, so keeping torch off its import path is
+    the difference between a ~200 MB image and a ~2.5 GB one — and a smaller
+    image is also a smaller attack surface on the security-critical component.
+    """
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - depends on install extras
+        raise RuntimeError(
+            "conversion requires torch — install with `uv sync --extra convert`"
+        ) from exc
+    return torch
+
+
+def _load_checkpoint(path: pathlib.Path) -> dict[str, Any]:
+    torch = _torch()
     # weights_only=True refuses to execute arbitrary reduce ops during *our* load.
     # The scan already gated this file; this is defence in depth for the one
     # moment the pipeline is obliged to open an untrusted pickle.
@@ -39,9 +53,10 @@ def _load_checkpoint(path: pathlib.Path) -> dict[str, torch.Tensor]:
     return {k: v for k, v in state.items() if isinstance(v, torch.Tensor)}
 
 
-def _verify_equivalence(
-    original: dict[str, torch.Tensor], converted_path: pathlib.Path
-) -> None:
+def _verify_equivalence(original: dict[str, Any], converted_path: pathlib.Path) -> None:
+    from safetensors.torch import load_file as load_safetensors
+
+    torch = _torch()
     roundtrip = load_safetensors(str(converted_path))
     if set(roundtrip) != set(original):
         missing = set(original) ^ set(roundtrip)
@@ -77,6 +92,8 @@ def run(cfg: Settings) -> dict[str, Any]:
             target = dst.with_suffix(".safetensors")
             # contiguous() because safetensors rejects non-contiguous views,
             # which shared-storage checkpoints routinely contain.
+            from safetensors.torch import save_file
+
             save_file({k: v.contiguous() for k, v in tensors.items()}, str(target))
             _verify_equivalence(tensors, target)
             converted.append(

@@ -1,0 +1,22 @@
+# VIOLATION 3: a perfectly valid model reference, but no verifier.
+#
+# The subtlest of the three. The digest is right, the registry is right -- but
+# with no init container nothing ever checks the signature, and the serving
+# container loads whatever the registry hands it. Structural conformance is not
+# verification; this is exactly the gap the init-container rule closes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-no-verifier
+  namespace: aegis
+  annotations:
+    aegis.dev/model: AEGIS_MODEL_REF
+spec:
+  restartPolicy: Never
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}

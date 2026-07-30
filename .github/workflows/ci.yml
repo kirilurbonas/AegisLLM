@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - run: uv sync --extra build
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        # Includes the gate test: a checkpoint whose __reduce__ calls os.system
+        # must be flagged, and conversion must refuse to run on it.
+        run: uv run pytest -q
+
+  supply-chain-gate:
+    name: Supply chain (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - run: uv sync --extra build
+
+      - name: Run the pipeline end to end
+        # --skip-registry stops after signing, so CI needs no registry and no
+        # Docker. Signing uses the local-key mode; sigstore keyless has no
+        # browser here, which is exactly why that mode exists.
+        run: uv run aegis all --skip-registry
+
+      - name: Publish the AIBOM and scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-evidence
+          path: |
+            artifacts/reports/**/*.json
+            artifacts/secured/**/aibom.cdx.json
+          if-no-files-found: warn
+
+  policies:
+    name: Kyverno policy validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Kyverno CLI
+        uses: kyverno/action-install-cli@v0.2.0
+
+      - name: Validate policy syntax
+        run: kyverno version && for p in policies/*.yaml; do
+             echo "── $p"; kyverno validate "$p" || exit 1; done
