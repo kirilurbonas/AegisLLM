@@ -36,11 +36,22 @@ resource "docker_image" "zot" {
   name = var.zot_image
 }
 
+resource "docker_volume" "registry_data" {
+  name = "${var.registry_name}-data"
+}
+
 resource "docker_container" "registry" {
   name     = var.registry_name
   image    = docker_image.zot.image_id
   restart  = "unless-stopped"
   must_run = true
+
+  # Without this, recreating the container silently empties the registry and
+  # every published model has to be rebuilt and re-signed.
+  volumes {
+    volume_name    = docker_volume.registry_data.name
+    container_path = "/var/lib/registry"
+  }
 
   ports {
     internal = 5000
