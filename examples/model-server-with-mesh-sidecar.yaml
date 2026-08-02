@@ -1,0 +1,32 @@
+# COMPLIANT, and a regression guard.
+#
+# Identical to the compliant pod except that a service mesh has injected its
+# proxy as a second init container. This must still be admitted.
+#
+# The original policy expressed "a verifier must be present" as a list pattern,
+# which Kyverno applies to *every* element — so the day Istio was installed, a
+# pod doing everything right was rejected because `istio-proxy` is not named
+# `aegis-verify`. The policy had quietly assumed nothing else would ever add an
+# init container, which is precisely what a mesh does.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-with-mesh-sidecar
+  namespace: aegis
+  annotations:
+    aegis.dev/model: AEGIS_MODEL_REF
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: aegis-registry:5000/aegis-verifier:dev
+      volumeMounts: [{name: models, mountPath: /models}]
+    - name: istio-proxy
+      image: docker.io/istio/proxyv2:1.24.0
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+      volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+  volumes:
+    - name: models
+      emptyDir: {}

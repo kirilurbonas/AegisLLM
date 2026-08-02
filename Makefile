@@ -10,6 +10,13 @@ REQUIRED_BINS := uv kind kubectl helm terraform oras cosign openssl
 # must use the service name, because inside a pod "localhost" is the pod itself.
 REGISTRY_HOST := localhost:5001
 REGISTRY_IN   := aegis-registry:5000
+VAULT_ADDR    := http://127.0.0.1:8200
+
+# Images are signed with the Vault Transit key when Vault is configured, and with
+# a local key file otherwise. Transit means the private key never exists on this
+# machine -- signing is an API call -- so there is nothing here to leak.
+COSIGN_KEY = $(if $(AEGIS_VAULT_ADDR),hashivault://$(AEGIS_VAULT_TRANSIT_KEY),keys/cosign.key)
+AEGIS_VAULT_TRANSIT_KEY ?= aegis-cosign
 VERIFIER_IMAGE := $(REGISTRY_HOST)/aegis-verifier:dev
 GATEWAY_IMAGE  := $(REGISTRY_HOST)/aegis-gateway:dev
 
@@ -101,7 +108,7 @@ test-policies: policies/tests/resources.yaml ## Kyverno policy unit tests (offli
 # ones the README shows and `make demo-admission` applies.
 policies/tests/resources.yaml: $(wildcard examples/*.yaml)
 	@ref="$(REGISTRY_IN)/models/all-minilm-l6-v2@sha256:$$(printf '1%.0s' {1..64})"; \
-	for f in compliant unpinned external no-verifier; do \
+	for f in compliant unpinned external no-verifier with-mesh-sidecar fake-verifier; do \
 		sed "s|AEGIS_MODEL_REF|$$ref|" examples/model-server-$$f.yaml | grep -v '^#'; \
 		echo "---"; \
 	done > $@
@@ -146,6 +153,70 @@ clean: ## Remove local artifacts (keeps signing keys)
 kubeconfig: ## Print the export line for this cluster's kubeconfig
 	@echo "export KUBECONFIG=$(PWD)/infra/terraform/kind/aegis-config"
 
+# --- identity: service mesh ---------------------------------------------------
+
+.PHONY: istio
+istio: ## Install Istio and apply the mTLS / JWT / authorization policies
+	helm repo add istio https://istio-release.storage.googleapis.com/charts >/dev/null 2>&1 || true
+	helm repo update >/dev/null
+	helm upgrade --install istio-base istio/base -n istio-system --create-namespace \
+		--wait --timeout 5m
+	helm upgrade --install istiod istio/istiod -n istio-system \
+		-f infra/istiod-values.yaml --wait --timeout 8m
+	@$(MAKE) --no-print-directory istio-policies
+
+.PHONY: istio-policies
+istio-policies: ## (Re)apply mesh policies, rendering the cluster JWKS in
+	kubectl apply -f policies/istio/peer-authentication.yaml
+	@uv run python scripts/render_jwks.py policies/istio/request-authentication.yaml \
+		| kubectl apply -f -
+	kubectl apply -f policies/istio/authorization-policy.yaml
+	@kubectl -n aegis get peerauthentication,requestauthentication,authorizationpolicy
+
+.PHONY: test-client
+test-client: ## Deploy an in-mesh caller with a projected SA token
+	kubectl apply -f examples/test-client.yaml
+	kubectl -n aegis wait --for=condition=Ready pod/aegis-test-client --timeout=120s
+
+.PHONY: demo-auth
+demo-auth: test-client ## Prove the front door: no token is refused, a valid token is served
+	@uv run python scripts/demo_auth.py
+
+# --- secrets: Vault -----------------------------------------------------------
+
+.PHONY: vault
+vault: ## Install Vault (raft) and configure Transit, kv-v2 and Kubernetes auth
+	helm repo add hashicorp https://helm.releases.hashicorp.com >/dev/null 2>&1 || true
+	helm repo update >/dev/null
+	helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
+		-f infra/vault-values.yaml --timeout 8m
+	./scripts/vault_bootstrap.sh
+	@$(MAKE) --no-print-directory vault-port-forward
+	@VAULT_ADDR=$(VAULT_ADDR) VAULT_TOKEN=$$(jq -r .root_token keys/vault-init.json) \
+		uv run aegis keys rotate --init
+
+.PHONY: vault-port-forward
+vault-port-forward: ## Background port-forward to Vault on :8200
+	@pgrep -f "port-forward.*vault.*8200" >/dev/null 2>&1 || { \
+		kubectl -n vault port-forward svc/vault 8200:8200 >/dev/null 2>&1 & \
+		sleep 4; }
+	@echo "✓ Vault reachable at $(VAULT_ADDR)"
+
+.PHONY: vault-env
+vault-env: ## eval $$(make vault-env) — export Vault credentials into your shell
+	@echo "export AEGIS_VAULT_ADDR=$(VAULT_ADDR)"
+	@echo "export VAULT_ADDR=$(VAULT_ADDR)"
+	@echo "export VAULT_TOKEN=$$(jq -r .root_token keys/vault-init.json)"
+
+.PHONY: vault-unseal
+vault-unseal: ## Re-unseal Vault after a cluster restart
+	./scripts/vault_bootstrap.sh
+
+.PHONY: keys-rotate
+keys-rotate: ## Rotate the model-signing key held in Vault
+	@VAULT_ADDR=$(VAULT_ADDR) VAULT_TOKEN=$$(jq -r .root_token keys/vault-init.json) \
+		AEGIS_VAULT_ADDR=$(VAULT_ADDR) uv run aegis keys rotate
+
 # --- pillar 2: admission gate -------------------------------------------------
 
 $(COSIGN2):
@@ -164,7 +235,7 @@ verifier-image: $(COSIGN2) ## Build, push and sign the verifier init-container i
 		| grep -i docker-content-digest | awk '{print $$2}' | tr -d '\r'); \
 	echo "→ signing $(REGISTRY_HOST)/aegis-verifier@$$digest"; \
 	COSIGN_PASSWORD="" $(COSIGN2) sign --yes --tlog-upload=false \
-		--allow-insecure-registry --key keys/cosign.key \
+		--allow-insecure-registry --key "$(COSIGN_KEY)" \
 		"$(REGISTRY_HOST)/aegis-verifier@$$digest"
 
 # --- pillar 3: runtime gateway -----------------------------------------------
@@ -179,7 +250,7 @@ gateway-image: $(COSIGN2) ## Build, push and sign the inference gateway image
 		| grep -i docker-content-digest | awk '{print $$2}' | tr -d '\r'); \
 	echo "→ signing $(REGISTRY_HOST)/aegis-gateway@$$digest"; \
 	COSIGN_PASSWORD="" $(COSIGN2) sign --yes --tlog-upload=false \
-		--allow-insecure-registry --key keys/cosign.key \
+		--allow-insecure-registry --key "$(COSIGN_KEY)" \
 		"$(REGISTRY_HOST)/aegis-gateway@$$digest"
 
 .PHONY: gateway-secret
@@ -198,7 +269,7 @@ deploy-gateway: gateway-secret ## Deploy the guardrailed gateway over a verified
 	kubectl -n aegis rollout status deploy/aegis-gateway --timeout=300s
 
 .PHONY: demo-guardrails
-demo-guardrails: ## Prove the guardrails against the live in-cluster gateway
+demo-guardrails: test-client ## Prove the guardrails against the live in-cluster gateway
 	@uv run python scripts/demo_guardrails.py
 
 .PHONY: kyverno

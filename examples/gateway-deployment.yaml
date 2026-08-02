@@ -14,6 +14,15 @@
 # Substitute AEGIS_MODEL_REF at apply time -- see `make deploy-gateway`. In a real
 # GitOps flow the digest is committed here, and bumping a model is a reviewed pull
 # request rather than an imperative action.
+# A dedicated identity. Istio derives the workload's SPIFFE certificate from this
+# ServiceAccount, and Vault's Kubernetes auth role is bound to it, so "who is this
+# workload" is one fact used consistently by the mesh and by the secret store.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-gateway
+  namespace: aegis
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +43,14 @@ spec:
       labels:
         app.kubernetes.io/name: aegis-gateway
         app.kubernetes.io/part-of: aegisllm
+        # Opt this pod into the mesh: STRICT mTLS, JWT validation and the
+        # authorization policies all hang off the sidecar.
+        sidecar.istio.io/inject: "true"
     spec:
+      serviceAccountName: aegis-gateway
+      # The gateway calls no Kubernetes API. Mounting a token it does not need
+      # hands an attacker a cluster credential for free.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -131,9 +147,9 @@ spec:
 # A caveat stated rather than glossed: NetworkPolicy applies to the *pod*, and
 # init containers share the pod's network namespace. The verifier needs the
 # registry, so the registry has to be reachable for the pod's whole lifetime.
-# Kubernetes cannot express "only the init container may egress". Narrowing this
-# further needs a service mesh with per-workload authorization policy (Istio),
-# which is the natural next step.
+# Kubernetes cannot express "only the init container may egress"; Istio
+# AuthorizationPolicy now covers the inbound side, and scoping egress per
+# container would need an egress gateway with per-workload policy.
 #
 # Verified enforced on this cluster: an identical deny-all policy took a test pod
 # from HTTP 200 to no route. kindnet does honour NetworkPolicy here -- worth
@@ -165,4 +181,15 @@ spec:
             cidr: 172.18.0.0/16
       ports:
         - { protocol: TCP, port: 5000 }
+    # istiod, so the sidecar can fetch its workload certificate and policy. Without
+    # this the pod joins the mesh and then fails to get an identity, which
+    # presents as a confusing connection error rather than an obvious auth
+    # failure.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+      ports:
+        - { protocol: TCP, port: 15012 }
+        - { protocol: TCP, port: 15010 }
     # Everything else -- the public internet included -- is denied by omission.

@@ -113,6 +113,49 @@ def cmd_verify_ref(
         raise typer.Exit(code=1) from exc
 
 
+keys_app = typer.Typer(help="Signing key management (Vault-backed)", no_args_is_help=True)
+app.add_typer(keys_app, name="keys")
+
+
+@keys_app.command("rotate")
+def cmd_keys_rotate(
+    init: bool = typer.Option(False, "--init", help="create only if absent"),
+) -> None:
+    """Generate the model-signing key inside Vault.
+
+    The key is created in this process's memory and PUT straight to Vault — it is
+    never written to the working tree. Rotation replaces it; artifacts signed with
+    the previous key keep verifying against the public key recorded alongside them.
+    """
+    from . import vault
+
+    cfg = settings
+    if not cfg.uses_vault:
+        raise typer.BadParameter(
+            "AEGIS_VAULT_ADDR is not set — nothing to rotate. "
+            "The local-key path generates on demand."
+        )
+    created = vault.generate_model_signing_key(cfg, rotate=not init)
+    if created:
+        stage("keys", "model-signing key stored in Vault", "ok")
+    else:
+        stage("keys", "model-signing key already present — no change", "info")
+
+
+@keys_app.command("show")
+def cmd_keys_show() -> None:
+    """Print the public keys verifiers need. Never prints private material."""
+    from . import registry, vault
+
+    cfg = settings
+    if not cfg.uses_vault:
+        raise typer.BadParameter("AEGIS_VAULT_ADDR is not set")
+    console.print("[bold]cosign (Vault Transit, non-exportable)[/]")
+    console.print(registry.export_transit_public_key(cfg).read_text())
+    console.print("[bold]model-signing (Vault kv-v2)[/]")
+    console.print(vault.public_key(cfg))
+
+
 @app.command("all")
 def cmd_all(
     model: str = ModelOpt,

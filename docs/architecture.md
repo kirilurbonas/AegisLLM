@@ -1,7 +1,7 @@
 # AegisLLM architecture
 
-Five control planes over one pipeline. Pillars 0-3 are built; 4 and 5 are
-scaffolded and planned.
+Five control planes over one pipeline, plus an identity and secrets layer
+underneath them. Pillars 0-3 are built; 4 and 5 are scaffolded and planned.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -217,6 +217,66 @@ Serving a real generative model exposed two supply-chain bugs worth recording:
   model a drop-in replacement — and it revealed that repos shipping *both* a
   pickle and a native safetensors were being published twice. The native file now
   wins and the redundant pickle is recorded as superseded.
+
+## Identity & secrets — design notes
+
+### Why Kubernetes is the identity provider
+
+Projected ServiceAccount tokens are real OIDC JWTs: audience-scoped, short-lived,
+rotated by the kubelet, and issued by a party the cluster already trusts. Using
+them for service-to-service auth means no Dex, no Keycloak, no extra database and
+no static credential to distribute — which also happens to fit an 8 GB Docker VM.
+Human users would arrive from a real IdP as an additional `jwtRules` entry; the
+policy shape does not change.
+
+The JWKS is **inlined** into the `RequestAuthentication` at apply time. Istio can
+fetch it from a URL, but the API server requires authentication on
+`/openid/v1/jwks`, and the usual workaround is to bind
+`system:service-account-issuer-discovery` to unauthenticated users — opening
+cluster metadata to anonymous callers so a config file can stay static. Rendering
+the keys in avoids that trade.
+
+### Why the application still checks
+
+Istio denies unauthenticated requests before they reach the process, so
+`gateway/auth.py` is a second line. It exists because the trust in
+`x-aegis-principal` is entirely a property of the deployment: run that pod outside
+the mesh and the header becomes attacker-controlled again. The module therefore
+fails closed on its own, and refuses to honour `AEGIS_REQUIRE_AUTH=false` when
+`KUBERNETES_SERVICE_HOST` is set.
+
+### Two key stores, deliberately not described as one
+
+| | cosign / OCI manifests | model-signing bundle |
+|---|---|---|
+| Where | Vault **Transit** | Vault **kv-v2** |
+| Private key on the build host | never | briefly, on tmpfs, during signing |
+| Can an operator export it | no — `exportable: false` | yes, it is a stored secret |
+| Why | cosign speaks `hashivault://` natively | `model_signing` has no KMS backend |
+
+Collapsing these into "the keys are in Vault" would overstate the second. The
+threat model keeps them apart, because the difference is exactly what an auditor
+would ask about.
+
+### Kyverno list patterns apply to every element
+
+The admission gate broke when Istio was installed. The rule expressed "a verifier
+init container must be present" as:
+
+```yaml
+pattern: {spec: {initContainers: [{name: aegis-verify, image: "*aegis-verifier*"}]}}
+```
+
+Kyverno matches that pattern against *each* element of the list, so an injected
+`istio-proxy` failed it and a compliant gateway was refused. The rule now counts
+matching elements with JMESPath and denies on zero — `not_null(..., \`[]\`)`,
+because a pod with no `initContainers` key at all makes the expression *error*,
+which Kyverno reports as neither pass nor fail. A rule that errors on the most
+obvious violation is not a rule.
+
+A second rule checks the verifier's image separately, via a conditional anchor
+that scopes it to that container. Presence alone would be satisfied by a busybox
+named `aegis-verify` doing nothing at all.
 
 ## Data flow
 

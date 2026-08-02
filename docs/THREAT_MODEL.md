@@ -1,8 +1,8 @@
 # Threat model
 
 Scope of this document: the model supply chain (Pillar 1), the platform
-foundation (Pillar 0), the CI/CD and admission gate (Pillar 2), and the runtime
-gateway (Pillar 3) — the parts that exist. Runtime threats are listed
+foundation (Pillar 0), the CI/CD and admission gate (Pillar 2), the runtime
+gateway (Pillar 3), and the identity and secrets layer — the parts that exist. Runtime threats are listed
 with their planned controls and marked as such — an unbuilt control is not a
 mitigation.
 
@@ -78,11 +78,34 @@ cannot secure (OpenVINO, ONNX, TF) are not ingested at all.
 is inherently incomplete — this is why conversion, not scanning, is the primary
 control.
 
-### T7 — Signing key compromise (**partially mitigated**)
-*Controls:* the key is gitignored, generated with 0600 permissions, and never
-leaves the machine. `sigstore` mode removes the long-lived key entirely.
-*Residual risk:* in `key` mode the key sits on the build host. Production would
-move this to Vault or a KMS/HSM, or use sigstore keyless with workload identity.
+### T7 — Signing key compromise (**mitigated for cosign; partially for model-signing**)
+The keys are the crown jewels: whoever holds them can forge provenance for any
+model and every downstream check will pass.
+
+*Controls:*
+- **cosign / OCI manifest signing — no private key exists on the build host.**
+  The key is a Vault **Transit** key created non-exportable, so signing is an API
+  call. `exportable: false` is not a policy that can be relaxed after the fact:
+  Vault will not emit the private half to anyone, including an operator holding
+  the root token. Verified: `vault read transit/keys/aegis-cosign` reports
+  `exportable: false`, and the whole supply chain signs and verifies with the
+  local key files deleted.
+- **model-signing — key held in Vault kv-v2.** `model_signing` offers only
+  elliptic-key, certificate, PKCS#11 and sigstore signers, so there is no KMS
+  backend to use. The key is generated in process memory by `aegis keys rotate`,
+  PUT straight to Vault, and fetched to a 0600 file under tmpfs only for the
+  moments a signature is produced, then deleted in a `finally` block.
+- Rotation is a single command (`make keys-rotate`).
+
+*Residual risk:* the model-signing key is necessarily materialised to sign, so a
+host compromise during a signing run could capture it. It is a smaller window
+than a key committed beside the code, and it is **not** equivalent to Transit —
+the two are deliberately not described as the same control. CI uses the sigstore
+keyless path, where no long-lived key exists at all. Closing this properly needs
+either PKCS#11 (an HSM) or KMS support upstream in `model_signing`.
+
+*Also residual:* Vault's unseal shares live in a gitignored file on the developer
+machine. Production auto-unseals against a cloud KMS and no human holds a share.
 
 ### T8 — Unsigned or substituted model reaching the cluster (**mitigated**)
 A human applies a manifest that mounts arbitrary weights, or points a serving pod
@@ -118,6 +141,39 @@ all capabilities dropped, and carries neither torch nor modelscan.
 *Residual risk:* the policy matches the init container by name and image glob. A
 cluster-admin who can edit ClusterPolicies can remove the gate entirely; Kyverno
 RBAC is the control there, and it is out of scope for this build.
+
+### T14 — Unauthenticated access to the model (**mitigated**)
+Until this was fixed the gateway had **no authentication at all**. It read an
+`x-aegis-client` header and believed it, so any caller could pick an identity,
+reset their quota by changing a string, and write arbitrary values into the audit
+log. This was the single largest gap between "demo" and "production".
+
+*Controls, layered:*
+- **Istio `PeerAuthentication: STRICT`** — plaintext connections are refused at
+  the proxy. A caller outside the mesh cannot complete a handshake at all
+  (verified: `curl` from a non-injected pod fails with connection reset).
+- **`RequestAuthentication`** validates a projected Kubernetes ServiceAccount
+  token — signature, issuer, expiry, and **audience**, so a token minted for a
+  different service cannot be replayed here. The JWKS is inlined at apply time
+  rather than exposing cluster OIDC discovery to anonymous callers.
+- **`AuthorizationPolicy`** denies the namespace by default and allows only
+  requests carrying a validated principal. Health probes are exempted by path.
+- **The application fails closed too.** `gateway/auth.py` reads only
+  `x-aegis-principal`, which the proxy overwrites on every request, and refuses
+  service when it is absent. The dev escape hatch is itself refused when
+  `KUBERNETES_SERVICE_HOST` is set, so a misconfigured deployment cannot silently
+  serve unauthenticated traffic.
+- Quotas key on the verified subject, so they can no longer be reset by a header.
+
+*Evidence:* `make demo-auth` — no credentials, a forged `x-aegis-principal`, the
+old `x-aegis-client`, and a garbage bearer token are all refused; a real projected
+token is served. `tests/test_auth.py` covers the same properties in isolation,
+including that a spoofed header cannot change the audited identity.
+
+*Residual risk:* callers are in-cluster workloads. Human/external users would come
+from a real IdP as an additional `jwtRules` entry — the shape does not change, but
+that path is not built. Authorization is currently coarse (any valid cluster
+principal); per-tenant rules are a one-line policy change.
 
 ### T9 — Prompt injection (**partially mitigated**)
 An attacker crafts input that overrides the system prompt, hijacks the persona, or
@@ -172,8 +228,10 @@ authorization policy is the next step.
 length cap, and a generation cap enforced in the backend regardless of what the
 caller requests. *Evidence:* verified live — request 61 of 60 returns 429.
 *Residual risk:* the window is per-process, so with N replicas the effective limit
-is N x the configured value. A real deployment moves it to Redis or the mesh; the
-code says so rather than implying a distributed quota.
+is N x the configured value. Quotas are now at least *correctly attributed* to a
+verified identity (T14), which is the part that was actually broken; making the
+window cluster-wide needs Redis or an Envoy global rate-limit service and is not
+yet done. The code says so rather than implying a distributed quota.
 
 ### T13 — System prompt leakage (**partially mitigated**)
 *Controls:* the system prompt is supplied from a Kubernetes Secret, not baked into

@@ -40,9 +40,15 @@ def backend(monkeypatch) -> StubBackend:
     return stub
 
 
+# What Istio writes after validating the JWT. Supplying it here stands in for a
+# request that already passed mesh authentication; tests/test_auth.py covers what
+# happens when it is absent or forged.
+MESH_IDENTITY = {"x-aegis-principal": "system:serviceaccount:aegis:test-caller"}
+
+
 @pytest.fixture
 def client(backend) -> TestClient:
-    return TestClient(app_module.app)
+    return TestClient(app_module.app, headers=MESH_IDENTITY)
 
 
 def test_healthz_and_readyz(client):
@@ -125,7 +131,7 @@ def test_unhandled_errors_do_not_leak_internals(client, backend):
 
     # Not a `with` block: entering the context runs lifespan startup, which
     # would try to load a real model from /models.
-    raw = TestClient(app_module.app, raise_server_exceptions=False)
+    raw = TestClient(app_module.app, raise_server_exceptions=False, headers=MESH_IDENTITY)
     response = raw.post("/v1/infer", json={"input": "hello"})
 
     assert response.status_code == 500

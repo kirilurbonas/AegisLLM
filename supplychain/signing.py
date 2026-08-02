@@ -19,6 +19,8 @@ Both produce the same artifact shape, so downstream stages don't care which ran.
 
 from __future__ import annotations
 
+import contextlib
+import shutil
 import subprocess
 from typing import Any
 
@@ -74,20 +76,55 @@ def _verifier(cfg: Settings, identity: dict[str, Any] | None) -> ms_verifying.Co
     return config.use_elliptic_key_verifier(public_key=cfg.public_key)
 
 
+@contextlib.contextmanager
+def vault_key(cfg: Settings):
+    """Materialise the model-signing key from Vault for the duration of a signing
+    run, then destroy it.
+
+    `model_signing` has no KMS backend, so the key must exist as a file to be
+    used at all. Keeping that window as short as possible — fetched to tmpfs,
+    deleted in a finally block — is the best available mitigation, and it is
+    still weaker than the Transit path used for cosign. Do not read this as
+    equivalent.
+    """
+    from . import vault
+
+    private_path, _ = vault.materialise_model_signing_key(cfg)
+    # The *public* half is written to its normal on-disk location and left there.
+    # It is not a secret, and every verifier — the init container, Kyverno, CI —
+    # needs it. Only the private half is transient.
+    cfg.public_key.parent.mkdir(parents=True, exist_ok=True)
+    cfg.public_key.write_text(vault.public_key(cfg))
+    try:
+        yield cfg.model_copy(update={"private_key": private_path})
+    finally:
+        shutil.rmtree(private_path.parent, ignore_errors=True)
+
+
 def run(cfg: Settings) -> dict[str, Any]:
     if not cfg.secured_dir.exists():
         raise FileNotFoundError("nothing to sign — run `aegis convert` first")
     if not cfg.aibom_path.exists():
         raise FileNotFoundError("no AIBOM present — run `aegis aibom` first")
 
+    if cfg.uses_vault and cfg.signing_mode == "key":
+        with vault_key(cfg) as scoped:
+            stage("sign", "model-signing key fetched from Vault (tmpfs, deleted after use)")
+            return _sign_with(scoped, key_source="vault")
+    return _sign_with(cfg, key_source="local-file")
+
+
+def _sign_with(cfg: Settings, key_source: str) -> dict[str, Any]:
     cfg.signed_dir.mkdir(parents=True, exist_ok=True)
     stage("sign", f"signing {cfg.secured_dir.name} in '{cfg.signing_mode}' mode")
     _signer(cfg).sign(cfg.secured_dir, cfg.signature_path)
 
     payload = {
         "mode": cfg.signing_mode,
+        "key_source": key_source,
         "signature": str(cfg.signature_path),
         "signed_dir": str(cfg.secured_dir),
+        # Never the private key path, and never its contents.
         "public_key": str(cfg.public_key) if cfg.signing_mode == "key" else None,
     }
     write_report(cfg.reports_dir / "sign.json", payload)

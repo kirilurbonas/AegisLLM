@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import auth
 from .guardrails import GuardrailConfig, InputGuardrail, OutputGuardrail
 from .limits import RateLimiter
 from .model import ModelBackend, load_backend
@@ -115,22 +116,21 @@ def readyz() -> dict:
 
 
 @app.get("/v1/model")
-def model_info() -> dict:
+def model_info(request: Request) -> dict:
     """Provenance, served from the AIBOM that travelled with the weights.
 
     Being able to ask a running service *which* model it is serving, and get an
     answer backed by a signed inventory, is the payoff for Pillars 1 and 2.
     """
+    # Authenticated too: which model a service is running, and at which revision,
+    # is reconnaissance an unauthenticated caller has no need for.
+    _principal(request)
     return _require_backend().provenance()
 
 
-def _client_id(request: Request) -> str:
-    # Real deployments key quotas on an authenticated identity. Istio mTLS
-    # provides that in-cluster; the header is the local-dev stand-in and is
-    # explicitly not an authentication mechanism.
-    return request.headers.get("x-aegis-client") or (
-        request.client.host if request.client else "anonymous"
-    )
+def _principal(request: Request) -> auth.Principal:
+    """The authenticated caller. Raises 401 when there isn't one."""
+    return auth.principal_from(request)
 
 
 def _audit(request_id: str, client: str, event: str, **fields) -> None:
@@ -148,17 +148,20 @@ def _audit(request_id: str, client: str, event: str, **fields) -> None:
 def infer(body: InferenceRequest, request: Request) -> InferenceResponse:
     backend = _require_backend()
     request_id = str(uuid.uuid4())
-    client = _client_id(request)
+    principal = _principal(request)
+    client = principal.quota_key
     started = time.perf_counter()
 
+    # Quotas are keyed on the verified subject, so they cannot be reset by
+    # changing a header.
     allowed, reason = rate_limiter.check(client, estimated_tokens=len(body.input) // 4)
     if not allowed:
-        _audit(request_id, client, "rate_limited", reason=reason)
+        _audit(request_id, client, "rate_limited", reason=reason, identity=principal.source)
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     inbound = input_guardrail(body.input)
     if inbound.blocked:
-        _audit(request_id, client, "blocked", **inbound.summary())
+        _audit(request_id, client, "blocked", identity=principal.source, **inbound.summary())
         # Categories, not detail. Telling a caller which pattern matched turns
         # the guardrail into a tool for finding a phrasing that gets through.
         raise HTTPException(
@@ -177,6 +180,7 @@ def infer(body: InferenceRequest, request: Request) -> InferenceResponse:
             request_id,
             client,
             "served",
+            identity=principal.source,
             input=inbound.summary(),
             latency_ms=round((time.perf_counter() - started) * 1000, 2),
         )
@@ -191,6 +195,7 @@ def infer(body: InferenceRequest, request: Request) -> InferenceResponse:
         request_id,
         client,
         "blocked" if outbound.blocked else "served",
+        identity=principal.source,
         input=inbound.summary(),
         output=outbound.summary(),
         latency_ms=round((time.perf_counter() - started) * 1000, 2),

@@ -1,0 +1,18 @@
+# Trimmed for an 8 GB Docker VM: one istiod replica, modest requests, and the
+# sidecar injector limited to namespaces that opt in by label.
+pilot:
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 640Mi}
+  autoscaleEnabled: false
+global:
+  proxy:
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {memory: 256Mi}
+meshConfig:
+  # Every proxy emits an access log. This is the request-level audit trail that
+  # complements the gateway's own application-level one.
+  accessLogFile: /dev/stdout
+  defaultConfig:
+    holdApplicationUntilProxyStarts: true

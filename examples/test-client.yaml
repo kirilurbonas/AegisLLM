@@ -1,0 +1,53 @@
+# A caller, for proving the front door works.
+#
+# The interesting part is the projected token volume. `audience: aegis-gateway`
+# asks the API server for a token that is only valid for this service — the
+# kubelet mints it, rotates it, and the gateway's RequestAuthentication rejects
+# anything issued for a different audience. No static credential is created,
+# nothing is stored in a Secret, and there is no shared key to leak.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-test-client
+  namespace: aegis
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aegis-test-client
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-test-client
+    # In the mesh, so its traffic is mTLS and it has a workload identity. A pod
+    # outside the mesh cannot complete a STRICT handshake at all — which is its
+    # own demonstration.
+    sidecar.istio.io/inject: "true"
+spec:
+  serviceAccountName: aegis-test-client
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: gateway-token
+          mountPath: /var/run/secrets/aegis
+          readOnly: true
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits: { memory: 64Mi }
+  volumes:
+    - name: gateway-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              # Short-lived by design: an exfiltrated token is useful for minutes,
+              # not months.
+              expirationSeconds: 600
+              audience: aegis-gateway

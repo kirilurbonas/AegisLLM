@@ -1,0 +1,20 @@
+# VIOLATION 4: the right name pointed at the wrong image.
+#
+# Presence is not verification. A check that only asks "is there an init
+# container called aegis-verify?" is satisfied by a busybox that does nothing,
+# and the serving container would start on completely unverified weights.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server-fake-verifier
+  namespace: aegis
+  annotations:
+    aegis.dev/model: AEGIS_MODEL_REF
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: aegis-verify
+      image: docker.io/library/busybox:latest
+  containers:
+    - name: server
+      image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine

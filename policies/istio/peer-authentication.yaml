@@ -1,0 +1,19 @@
+# Workload identity: mutual TLS, mandatory.
+#
+# STRICT means a plaintext connection to any pod in the `aegis` namespace is
+# refused at the proxy, before it reaches the application. Every caller must
+# present a certificate, and Istio issues those per-workload from SPIFFE
+# identities derived from the ServiceAccount — so "who is calling" becomes a
+# cryptographic fact rather than a header the caller chose.
+#
+# This is the layer that makes the gateway's authorization decisions meaningful.
+# Without it, anything that can reach the pod's IP can talk to it, and the JWT
+# check below would be the only thing standing in the way.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: aegis-strict-mtls
+  namespace: aegis
+spec:
+  mtls:
+    mode: STRICT

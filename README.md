@@ -14,6 +14,7 @@ The software supply chain got secured over the last decade. The *model* supply c
 | 3. Runtime security gateway | FastAPI + input/output guardrails, quotas, egress lockdown, audit trail | ✅ implemented |
 | 4. Continuous AI red-teaming (garak / promptfoo) | | 🚧 planned |
 | 5. Observability & governance | | 🚧 planned |
+| **Identity & secrets** | Istio STRICT mTLS + JWT auth; signing keys in Vault (Transit, non-exportable) | ✅ implemented |
 
 See [docs/architecture.md](docs/architecture.md) for the full five-pillar design and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the OWASP LLM Top 10 mapping.
 
@@ -166,6 +167,62 @@ Three smaller decisions worth noting:
 The demo model is an untrained stub that emits gibberish. That is deliberate: the
 security scaffolding is the product, and guardrails act on text whether or not it
 is coherent.
+
+## Identity & secrets: closing the two production gaps
+
+Pillars 1–3 were demonstrably secure about *models* while being naive about
+*callers* and *keys*. Two findings from auditing the repo against a production
+bar, and what was done:
+
+**1. The gateway had no authentication.** It read an `x-aegis-client` header and
+believed it — so quotas were bypassable by changing a string, and the audit log
+recorded whatever the caller claimed. Now:
+
+```bash
+make istio          # STRICT mTLS + JWT validation + deny-by-default authorization
+make demo-auth
+```
+
+```
+✓ no credentials at all      HTTP 403  — no validated principal, refused by policy
+✓ forged identity header     HTTP 403  — the proxy owns that header, not the caller
+✓ the old spoofable header   HTTP 403  — x-aegis-client is now inert
+✓ garbage bearer token       HTTP 401  — rejected by the mesh, not the application
+✓ valid projected SA token   HTTP 200  — audience-scoped, short-lived, real
+```
+
+Identity comes from **projected Kubernetes ServiceAccount tokens** — real OIDC
+JWTs, audience-scoped and kubelet-rotated — so service-to-service auth needs no
+extra IdP. Istio validates signature, issuer, expiry and audience, then writes the
+subject into a header it overwrites on every request. The app reads only that
+header and fails closed; the dev escape hatch refuses to work in-cluster, because
+a deployment that silently serves unauthenticated traffic is the exact failure
+being prevented.
+
+**2. Signing keys were files on disk with empty passphrases.** Now the cosign key
+is a Vault **Transit** key created *non-exportable* — signing is an API call and
+the private half cannot be read out by anyone, including an operator with the root
+token. The whole supply chain was re-run with the local key files deleted to prove
+it.
+
+`model_signing` has no KMS backend (elliptic-key, certificate, PKCS#11 and
+sigstore signers only), so its key lives in Vault kv-v2 and is materialised to
+tmpfs only for the moments a signature is produced. That is a real improvement and
+**not** equivalent to Transit — [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) keeps
+them separate rather than blurring both into "keys are in Vault".
+
+### A policy bug the mesh exposed
+
+Installing Istio broke the admission gate, and the reason is worth keeping. The
+rule said "a verifier init container must be present" as a Kyverno list pattern —
+but Kyverno applies list patterns to *every* element, so the moment Istio injected
+its proxy as a second init container, a fully compliant gateway was rejected
+because `istio-proxy` is not named `aegis-verify`. The policy had silently assumed
+nothing would ever add an init container.
+
+It is now a count-based `deny` selecting by name, plus a separate rule asserting
+the verifier image is the real one (presence alone would be satisfied by a busybox
+doing nothing). Both cases are locked in as policy tests.
 
 ## Threat coverage
 

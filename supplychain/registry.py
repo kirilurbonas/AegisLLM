@@ -123,11 +123,20 @@ def _resolve_digest(cfg: Settings, ref: str) -> str:
 
 
 def ensure_cosign_key(cfg: Settings) -> None:
-    """Generate the cosign keypair if absent.
+    """Ensure a usable cosign signing key.
 
-    Empty passphrase: this is a local demo key. Production puts this in a KMS —
-    see the residual risk noted in docs/THREAT_MODEL.md.
+    With Vault configured there is nothing to generate: the Transit key was
+    created inside Vault as non-exportable, so no private key exists on this
+    host to create, protect, or leak. Only the public key is materialised, and
+    only so Kyverno and offline verifiers have something to check against.
+
+    Without Vault this falls back to a local keypair with an empty passphrase —
+    fine for a laptop, not for production. That gap is exactly what the Vault
+    path closes; see T7 in docs/THREAT_MODEL.md.
     """
+    if cfg.uses_vault:
+        export_transit_public_key(cfg)
+        return
     if cfg.cosign_key.exists() and cfg.cosign_pub.exists():
         return
     cfg.cosign_key.parent.mkdir(parents=True, exist_ok=True)
@@ -167,16 +176,55 @@ def _cosign_sign(cfg: Settings, pinned_ref: str) -> bool:
         # cosign v3: the default signing config assumes a transparency log, which
         # a local/air-gapped registry has no route to.
         ["cosign", "sign", "--yes", "--tlog-upload=false", "--use-signing-config=false",
-         "--allow-insecure-registry", "--key", str(cfg.cosign_key), pinned_ref],
+         "--allow-insecure-registry", "--key", cfg.cosign_key_uri, pinned_ref],
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, "COSIGN_PASSWORD": ""},
+        env=_cosign_env(cfg),
     )
     if result.returncode != 0:
         raise RuntimeError(f"cosign sign failed:\n{result.stderr.strip()}")
-    stage("push", "cosign signature attached to the OCI manifest", "ok")
+    where = "Vault Transit" if cfg.uses_vault else "local key"
+    stage("push", f"cosign signature attached to the OCI manifest ({where})", "ok")
     return True
+
+
+def _cosign_env(cfg: Settings) -> dict[str, str]:
+    """Environment for a cosign invocation.
+
+    VAULT_TOKEN is read from the ambient environment rather than a setting: it is
+    a short-lived credential and must never end up in a config file, a report, or
+    this repo.
+    """
+    env = {**os.environ, "COSIGN_PASSWORD": ""}
+    if cfg.uses_vault:
+        env["VAULT_ADDR"] = cfg.vault_addr
+        if not env.get("VAULT_TOKEN"):
+            raise RuntimeError(
+                "AEGIS_VAULT_ADDR is set but VAULT_TOKEN is not in the environment. "
+                "Run `eval $(make vault-env)` first."
+            )
+    return env
+
+
+def export_transit_public_key(cfg: Settings) -> pathlib.Path:
+    """Write Vault's Transit *public* key to disk for verifiers.
+
+    Public keys are not secrets — Kyverno, CI, and any offline verifier need one.
+    The private half stays in Vault and cannot be exported at all.
+    """
+    result = subprocess.run(
+        ["cosign", "public-key", "--key", cfg.cosign_key_uri],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_cosign_env(cfg),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not read the Transit public key:\n{result.stderr.strip()}")
+    cfg.cosign_pub.parent.mkdir(parents=True, exist_ok=True)
+    cfg.cosign_pub.write_text(result.stdout)
+    return cfg.cosign_pub
 
 
 def cosign_verify(cfg: Settings, pinned_ref: str, public_key: pathlib.Path) -> None:

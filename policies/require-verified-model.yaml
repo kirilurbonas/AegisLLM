@@ -91,8 +91,46 @@ spec:
         message: >-
           A pod serving a model must run the `aegis-verify` init container. It is
           what actually checks the signature, and it fails closed.
+        # Expressed as a deny-on-count rather than a list pattern, and that
+        # distinction was learned the hard way. The original pattern was:
+        #
+        #   pattern: {spec: {initContainers: [{name: aegis-verify, image: "*aegis-verifier*"}]}}
+        #
+        # Kyverno applies a list pattern to *every* element, so the moment Istio
+        # injected its proxy as a second init container, a perfectly compliant
+        # gateway was rejected because `istio-proxy` is not named `aegis-verify`.
+        # The policy had silently encoded an assumption that nothing else would
+        # ever add an init container — which is exactly what a service mesh does.
+        #
+        # Selecting by name and asserting the count says what was actually meant:
+        # "a verifier must be present", not "everything must be the verifier".
+        deny:
+          conditions:
+            any:
+              # not_null(..., `[]`) because a pod with no initContainers at all
+              # has no such key, and indexing null is an evaluation *error* --
+              # which Kyverno surfaces as neither pass nor fail. A rule that
+              # errors on the most obvious violation is not a rule.
+              - key: "{{ length(not_null(request.object.spec.initContainers, `[]`)[?name=='aegis-verify']) }}"
+                operator: Equals
+                value: 0
+
+    - name: verifier-image-must-be-the-signed-verifier
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              annotations:
+                aegis.dev/model: "?*"
+      validate:
+        message: >-
+          The `aegis-verify` init container must run the aegis verifier image.
+          Pointing that name at some other image would satisfy the presence check
+          while doing no verification at all.
         pattern:
           spec:
             initContainers:
-              - name: aegis-verify
+              # The conditional anchor scopes this to the verifier only, leaving
+              # mesh-injected and other init containers alone.
+              - (name): aegis-verify
                 image: "*aegis-verifier*"

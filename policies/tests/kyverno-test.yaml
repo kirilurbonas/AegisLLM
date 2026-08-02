@@ -55,3 +55,25 @@ results:
     resources: [model-server-no-verifier]
     kind: Pod
     result: fail
+
+  # Regression: a mesh-injected sidecar must not break a compliant pod. The
+  # original list pattern applied to every init container, so adding Istio
+  # rejected a pod that was doing everything right.
+  - policy: require-verified-model
+    rule: verifier-init-container-must-be-present
+    resources: [model-server-with-mesh-sidecar]
+    kind: Pod
+    result: pass
+  - policy: require-verified-model
+    rule: verifier-image-must-be-the-signed-verifier
+    resources: [model-server-with-mesh-sidecar]
+    kind: Pod
+    result: pass
+
+  # Presence alone is not enough: the right name pointed at the wrong image
+  # would satisfy a naive check while verifying nothing.
+  - policy: require-verified-model
+    rule: verifier-image-must-be-the-signed-verifier
+    resources: [model-server-fake-verifier]
+    kind: Pod
+    result: fail

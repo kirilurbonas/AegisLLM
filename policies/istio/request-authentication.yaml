@@ -1,0 +1,49 @@
+# Caller identity: validated JWTs, no exceptions.
+#
+# The gateway used to trust an `x-aegis-client` header, which anyone could set —
+# so the per-client quotas were decorative and the audit log recorded whatever the
+# caller felt like claiming. This replaces that with a signed assertion.
+#
+# The tokens are **projected Kubernetes ServiceAccount tokens**. They are real
+# OIDC JWTs, audience-scoped, short-lived, and rotated by the kubelet, and the
+# cluster is already an issuer — so service-to-service identity needs no extra
+# component. That matters on a laptop-sized cluster, and it is a legitimate
+# production pattern for in-cluster callers. Human users would come from a real
+# IdP (Entra, Okta, Keycloak) plugged in as an additional `jwtRules` entry;
+# nothing else here would change.
+#
+# The JWKS is inlined rather than fetched from `jwksUri`. The API server requires
+# authentication on /openid/v1/jwks, and the usual workaround is to bind
+# `system:service-account-issuer-discovery` to unauthenticated users — granting
+# the whole world read access to cluster metadata to save a templating step.
+# `make istio-policies` renders the current keys in instead.
+#
+# IMPORTANT: `forwardOriginalToken: false` and no `outputPayloadToHeader` here.
+# The proxy strips the incoming Authorization header from the upstream request and
+# the application receives identity only via the fields Istio sets, so a caller
+# cannot smuggle claims past the proxy.
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: aegis-gateway-jwt
+  namespace: aegis
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-gateway
+  jwtRules:
+    - issuer: "https://kubernetes.default.svc.cluster.local"
+      audiences:
+        # A token minted for some other audience — the API server, another
+        # service — is not accepted here. This is what stops a token intended
+        # for one purpose being replayed against the model.
+        - aegis-gateway
+      forwardOriginalToken: false
+      outputClaimToHeaders:
+        # The proxy overwrites these on every request, so a client-supplied value
+        # is discarded. This is the only channel by which the gateway learns who
+        # the caller is.
+        - header: x-aegis-principal
+          claim: sub
+      jwks: |
+        AEGIS_CLUSTER_JWKS

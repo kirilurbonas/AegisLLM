@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Exercise the deployed gateway and assert each guardrail actually fires.
 
-This is a demo that can fail. Every case states the expected status up front, and
-the script exits non-zero if reality disagrees — so it doubles as a smoke test of
-the whole Pillar 1-3 chain: signed model, verified at start-up, served behind
-guardrails.
+Runs from inside the mesh, as an authenticated caller. It used to port-forward
+and call the service directly, which stopped working the moment authentication
+landed — a port-forward still traverses the sidecar, so an unauthenticated call
+is refused before any guardrail is reached. Calling as a real workload with a
+projected ServiceAccount token is both the fix and the more honest demo: this is
+how anything actually talks to the gateway.
 
-Run with the gateway port-forwarded (`make demo-guardrails` does this for you).
+Every case states its expected status and the script exits non-zero on any
+mismatch, so it doubles as a smoke test of the whole Pillar 1-3 chain plus the
+identity layer.
 """
 
 from __future__ import annotations
@@ -14,19 +18,21 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 
-BASE = "http://127.0.0.1:18080"
+NAMESPACE = "aegis"
+CLIENT_POD = "aegis-test-client"
+GATEWAY = "http://aegis-gateway.aegis.svc.cluster.local"
+TOKEN_PATH = "/var/run/secrets/aegis/token"
 
-# (label, payload, expected status, what the case demonstrates)
+AUTH = f'-H "Authorization: Bearer $(cat {TOKEN_PATH})"'
+
+# (label, request body, expected status, what it demonstrates)
 CASES = [
     (
         "clean prompt",
         {"input": "The quarterly report shows", "max_tokens": 8},
         200,
-        "ordinary traffic is served",
+        "ordinary traffic from an authenticated caller is served",
     ),
     (
         "prompt injection",
@@ -67,59 +73,44 @@ CASES = [
 ]
 
 
-def post(payload: dict) -> tuple[int, dict]:
-    request = urllib.request.Request(
-        f"{BASE}/v1/infer",
-        data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json"},
-        method="POST",
+def _exec(command: str) -> str:
+    result = subprocess.run(
+        ["kubectl", "-n", NAMESPACE, "exec", CLIENT_POD, "-c", "curl", "--",
+         "sh", "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read()
-        try:
-            return exc.code, json.loads(body)
-        except json.JSONDecodeError:
-            return exc.code, {"raw": body.decode(errors="replace")}
+    return (result.stdout or result.stderr).strip()
 
 
-def wait_for_ready(attempts: int = 30) -> None:
-    for _ in range(attempts):
-        try:
-            with urllib.request.urlopen(f"{BASE}/readyz", timeout=5) as response:
-                if response.status == 200:
-                    return
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            pass
-        time.sleep(2)
-    raise SystemExit(f"✗ gateway never became ready at {BASE}")
+def post(payload: dict, path: str = "/v1/infer") -> str:
+    body = json.dumps(payload).replace("'", "'\\''")
+    return _exec(
+        f"curl -s -o /dev/null -w '%{{http_code}}' -m 60 -X POST {GATEWAY}{path} "
+        f"-H 'content-type: application/json' {AUTH} -d '{body}'"
+    ).splitlines()[-1]
+
+
+def provenance() -> dict:
+    raw = _exec(f"curl -s -m 30 {GATEWAY}/v1/model {AUTH}")
+    return json.loads(raw.splitlines()[-1])
 
 
 def main() -> int:
-    wait_for_ready()
-
-    provenance = json.loads(urllib.request.urlopen(f"{BASE}/v1/model", timeout=10).read())
+    info = provenance()
     print("Serving a model this service can prove the origin of:")
-    print(f"  {provenance['group']}/{provenance['name']}")
-    print(f"  revision     {provenance['revision']}")
-    print(f"  scan verdict {provenance['scan_verdict']}")
-    print(f"  weights      {provenance['weights_format']}\n")
+    print(f"  {info['group']}/{info['name']}")
+    print(f"  revision     {info['revision']}")
+    print(f"  scan verdict {info['scan_verdict']}")
+    print(f"  weights      {info['weights_format']}\n")
 
     failures = 0
     for label, payload, expected, note in CASES:
-        status, body = post(payload)
-        ok = status == expected
+        status = post(payload)
+        ok = status == str(expected)
         failures += not ok
-        mark = "✓" if ok else "✗"
-        print(f"{mark} {label:<26} HTTP {status} (expected {expected})  — {note}")
-        if status == 422:
-            categories = body.get("detail", {}).get("categories", [])
-            print(f"    categories: {', '.join(categories) or 'n/a'}")
-        elif status == 200 and body.get("guardrails", {}).get("input", {}).get("findings"):
-            print(f"    input guardrail: {body['guardrails']['input']['decision']} "
-                  f"{body['guardrails']['input']['findings']}")
+        print(f"{'✓' if ok else '✗'} {label:<26} HTTP {status} (expected {expected})  — {note}")
 
     print()
     if failures:
@@ -129,17 +120,5 @@ def main() -> int:
     return 0
 
 
-def _port_forward():
-    return subprocess.Popen(
-        ["kubectl", "-n", "aegis", "port-forward", "svc/aegis-gateway", "18080:80"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 if __name__ == "__main__":
-    forward = _port_forward()
-    try:
-        sys.exit(main())
-    finally:
-        forward.terminate()
+    sys.exit(main())

@@ -1,0 +1,51 @@
+# Authorization: deny by default, then allow exactly what is needed.
+#
+# Two policies, and the order of reasoning matters:
+#
+#   1. `aegis-deny-all` is an ALLOW policy with no rules. In Istio that means
+#      "allow nothing" — every request to every workload in the namespace is
+#      refused unless another policy permits it. Starting from deny is the only
+#      way to be sure about what is reachable; an allowlist bolted onto a
+#      default-allow posture is a list of the things you remembered.
+#
+#   2. `aegis-gateway-callers` permits requests to the gateway that carry a
+#      validated JWT principal. `requestPrincipals` only matches when the
+#      RequestAuthentication above actually verified the token — a malformed or
+#      absent token yields no principal and the request is denied here.
+#
+# Health probes are exempted by path: kubelet probes come from the node and carry
+# no token, and a gateway that cannot be probed never becomes Ready. The exemption
+# is narrow — two paths, no body, no model access.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: aegis-deny-all
+  namespace: aegis
+spec:
+  {}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: aegis-gateway-callers
+  namespace: aegis
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-gateway
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # Any authenticated caller from this cluster's issuer. Tightening this
+            # to specific ServiceAccounts is a one-line change and is what a real
+            # deployment would do per tenant.
+            requestPrincipals: ["https://kubernetes.default.svc.cluster.local/*"]
+      to:
+        - operation:
+            methods: ["POST", "GET"]
+            paths: ["/v1/*"]
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/healthz", "/readyz"]

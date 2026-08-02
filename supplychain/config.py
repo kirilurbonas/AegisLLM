@@ -46,6 +46,25 @@ class Settings(BaseSettings):
     cosign_pub: pathlib.Path = REPO_ROOT / "keys" / "cosign.pub"
     sigstore_staging: bool = False
 
+    # When set, cosign signs through Vault's Transit engine instead of a local
+    # key file. The private key is generated inside Vault as non-exportable, so
+    # signing becomes an API call and the key never touches the build host —
+    # which is the whole point. Empty means the local-key path, still needed for
+    # genuinely offline work.
+    vault_addr: str = ""
+    vault_transit_key: str = "aegis-cosign"
+
+    @property
+    def cosign_key_uri(self) -> str:
+        """What to pass to `cosign --key`: a Vault URI, or a local file path."""
+        if self.vault_addr:
+            return f"hashivault://{self.vault_transit_key}"
+        return str(self.cosign_key)
+
+    @property
+    def uses_vault(self) -> bool:
+        return bool(self.vault_addr)
+
     @property
     def model_slug(self) -> str:
         """Registry- and filesystem-safe form of the model id."""
