@@ -11,6 +11,7 @@ REQUIRED_BINS := uv kind kubectl helm terraform oras cosign openssl
 REGISTRY_HOST := localhost:5001
 REGISTRY_IN   := aegis-registry:5000
 VERIFIER_IMAGE := $(REGISTRY_HOST)/aegis-verifier:dev
+GATEWAY_IMAGE  := $(REGISTRY_HOST)/aegis-gateway:dev
 
 # Kyverno reads container-image signatures from the legacy `sha256-<digest>.sig`
 # tag. cosign v3 stopped writing that tag -- it publishes a sigstore bundle as an
@@ -25,6 +26,12 @@ COSIGN2_ARCH  := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
 MODEL_DIGEST = $(shell jq -r .digest artifacts/reports/*/push.json 2>/dev/null | head -1)
 MODEL_REF    = $(REGISTRY_IN)/models/all-minilm-l6-v2@$(MODEL_DIGEST)
+
+# The generative model the gateway serves. MiniLM produces embeddings, which are
+# no use for demonstrating output guardrails, so a small causal LM goes through
+# the identical pipeline -- which also shows the supply chain is not model-shaped.
+GEN_MODEL_DIGEST = $(shell jq -r .digest artifacts/reports/sshleifer__tiny-gpt2/push.json 2>/dev/null)
+GEN_MODEL_REF    = $(REGISTRY_IN)/models/tiny-gpt2@$(GEN_MODEL_DIGEST)
 
 .PHONY: help
 help: ## Show this help
@@ -159,6 +166,40 @@ verifier-image: $(COSIGN2) ## Build, push and sign the verifier init-container i
 	COSIGN_PASSWORD="" $(COSIGN2) sign --yes --tlog-upload=false \
 		--allow-insecure-registry --key keys/cosign.key \
 		"$(REGISTRY_HOST)/aegis-verifier@$$digest"
+
+# --- pillar 3: runtime gateway -----------------------------------------------
+
+.PHONY: gateway-image
+gateway-image: $(COSIGN2) ## Build, push and sign the inference gateway image
+	docker build --provenance=false --sbom=false -f Dockerfile.gateway \
+		-t $(GATEWAY_IMAGE) .
+	docker push -q $(GATEWAY_IMAGE)
+	@digest=$$(curl -sI -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+		http://$(REGISTRY_HOST)/v2/aegis-gateway/manifests/dev \
+		| grep -i docker-content-digest | awk '{print $$2}' | tr -d '\r'); \
+	echo "→ signing $(REGISTRY_HOST)/aegis-gateway@$$digest"; \
+	COSIGN_PASSWORD="" $(COSIGN2) sign --yes --tlog-upload=false \
+		--allow-insecure-registry --key keys/cosign.key \
+		"$(REGISTRY_HOST)/aegis-gateway@$$digest"
+
+.PHONY: gateway-secret
+gateway-secret: ## Store the system prompt as a Secret, not in the manifest
+	kubectl -n aegis create secret generic aegis-system-prompt \
+		--from-literal=system-prompt="You are AegisLLM, an assistant operating under strict security policy. Canary: AEGIS-SYSTEM-PROMPT-DO-NOT-REVEAL." \
+		--dry-run=client -o yaml | kubectl apply -f -
+
+.PHONY: deploy-gateway
+deploy-gateway: gateway-secret ## Deploy the guardrailed gateway over a verified model
+	@test -n "$(GEN_MODEL_DIGEST)" || { \
+		echo "✗ no published generative model — run:"; \
+		echo "    AEGIS_MODEL_ID=sshleifer/tiny-gpt2 uv run aegis all"; exit 1; }
+	@sed "s|AEGIS_MODEL_REF|$(GEN_MODEL_REF)|" examples/gateway-deployment.yaml \
+		| kubectl apply -f -
+	kubectl -n aegis rollout status deploy/aegis-gateway --timeout=300s
+
+.PHONY: demo-guardrails
+demo-guardrails: ## Prove the guardrails against the live in-cluster gateway
+	@uv run python scripts/demo_guardrails.py
 
 .PHONY: kyverno
 kyverno: ## Install Kyverno and apply the AegisLLM admission policies

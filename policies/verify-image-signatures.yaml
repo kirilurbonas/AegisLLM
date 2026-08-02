@@ -33,6 +33,7 @@ spec:
         # expected to carry our signature.
         - imageReferences:
             - "*/aegis-verifier*"
+            - "*/aegis-gateway*"
             - "*/aegisllm*"
           # cosign v3 stores signatures as OCI 1.1 referrers rather than the
           # legacy `sha256-<digest>.sig` tag. Without this, Kyverno looks for the

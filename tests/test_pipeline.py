@@ -41,7 +41,7 @@ def test_conversion_is_tensor_faithful(staged):
     original = torch.load(
         staged.staging_dir / "pytorch_model.bin", map_location="cpu", weights_only=True
     )
-    converted = load_file(str(staged.secured_dir / "pytorch_model.safetensors"))
+    converted = load_file(str(staged.secured_dir / "model.safetensors"))
 
     assert set(converted) == set(original)
     for name, tensor in original.items():
@@ -70,7 +70,7 @@ def test_aibom_records_provenance_and_hashes(secured):
 
     # Every shipped file is inventoried with a SHA-256.
     subcomponents = {c["name"]: c for c in root["components"]}
-    assert "pytorch_model.safetensors" in subcomponents
+    assert "model.safetensors" in subcomponents
     for component in subcomponents.values():
         assert component["hashes"][0]["alg"] == "SHA-256"
 
@@ -83,7 +83,7 @@ def test_signed_model_verifies(secured):
 @pytest.mark.parametrize("staged", ["benign_checkpoint"], indirect=True)
 def test_tampered_weights_fail_verification(secured):
     """One flipped byte must be enough to reject the model."""
-    target = secured.secured_dir / "pytorch_model.safetensors"
+    target = secured.secured_dir / "model.safetensors"
     with target.open("r+b") as handle:
         handle.seek(-1, 2)
         last = handle.read(1)
@@ -135,3 +135,33 @@ def test_repo_of_strips_tags_and_digests_not_ports(reference, expected):
     from supplychain.registry import repo_of
 
     assert repo_of(reference) == expected
+
+
+@pytest.fixture
+def tied_weights_checkpoint(tmp_path):
+    """A GPT-2-shaped checkpoint where lm_head aliases the embedding."""
+    embedding = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    model_dir = tmp_path / "tied-model"
+    model_dir.mkdir()
+    torch.save(
+        {"transformer.wte.weight": embedding, "lm_head.weight": embedding},
+        model_dir / "pytorch_model.bin",
+    )
+    (model_dir / "config.json").write_text('{"architectures": ["GPT2LMHeadModel"]}')
+    return model_dir
+
+
+@pytest.mark.parametrize("staged", ["tied_weights_checkpoint"], indirect=True)
+def test_tied_weights_convert_without_losing_tensors(staged):
+    """safetensors cannot express aliasing; nothing may be silently dropped."""
+    scan.run(staged)
+    report = convert.run(staged)
+
+    converted = load_file(str(staged.secured_dir / "model.safetensors"))
+
+    assert set(converted) == {"transformer.wte.weight", "lm_head.weight"}
+    assert torch.equal(converted["transformer.wte.weight"], converted["lm_head.weight"])
+    assert sorted(report["converted"][0]["untied_tensors"]) == [
+        "lm_head.weight",
+        "transformer.wte.weight",
+    ]

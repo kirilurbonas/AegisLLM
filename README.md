@@ -11,7 +11,7 @@ The software supply chain got secured over the last decade. The *model* supply c
 | 1. Secure model supply chain | ingest → scan → safetensors → AIBOM → sign → OCI registry → verify | ✅ implemented |
 | 0. Foundation | Terraform `kind` cluster, Zot registry, ArgoCD GitOps | ✅ implemented |
 | 2. Hardened CI/CD + admission gate | Trivy → cosign → SLSA provenance; Kyverno refuses unsigned images and unverified models | ✅ implemented |
-| 3. Runtime security gateway (FastAPI + guardrails) | | 🚧 planned |
+| 3. Runtime security gateway | FastAPI + input/output guardrails, quotas, egress lockdown, audit trail | ✅ implemented |
 | 4. Continuous AI red-teaming (garak / promptfoo) | | 🚧 planned |
 | 5. Observability & governance | | 🚧 planned |
 
@@ -86,7 +86,7 @@ make demo-admission        # the gate, proven
 → the serving container sees:
 serving verified model from /models:
 aibom.cdx.json
-pytorch_model.safetensors
+model.safetensors
 ── unpinned (must be REFUSED) ──
   ✓ blocked by rule: model-must-be-digest-pinned
 ── external (must be REFUSED) ──
@@ -114,19 +114,72 @@ rather than chosen, and records two version mismatches (cosign v3 ↔ Kyverno 1.
 oras 1.2 ↔ 1.3) that both fail in the misleading direction of looking like a
 missing signature.
 
+## Pillar 3: the only door to the model
+
+```bash
+AEGIS_MODEL_ID=sshleifer/tiny-gpt2 uv run aegis all   # sign a generative model
+make gateway-image deploy-gateway                     # build, sign, deploy
+make demo-guardrails                                  # prove the guardrails
+```
+
+```
+Serving a model this service can prove the origin of:
+  sshleifer/tiny-gpt2
+  revision     5f91d94bd9cd7190a9f3216ff93cd1dd95f2c7be
+  scan verdict PASS
+  weights      safetensors
+
+✓ clean prompt               HTTP 200  — ordinary traffic is served
+✓ prompt injection           HTTP 422  — LLM01 instruction override refused
+✓ system prompt extraction   HTTP 422  — LLM07 extraction attempt refused
+✓ role injection             HTTP 422  — LLM01 chat-template injection refused
+✓ credential in prompt       HTTP 422  — LLM02 secret never reaches model or log
+✓ PII in prompt              HTTP 200  — LLM02 redacted, not refused: it still works
+✓ oversized prompt           HTTP 422  — LLM10 unbounded input refused
+```
+
+**The guardrails are a weak control and the repo says so.** Pattern matching
+catches known phrasings and casual attempts; paraphrase, encoding, translation or
+multi-turn splitting will get past it. Anyone shipping a regex list as "prompt
+injection protection" is building security theatre.
+
+What actually bounds the damage is architectural, and does not degrade as the
+attacker gets more creative — the gateway has **no internet egress** (verified: a
+public-internet connect from inside the pod times out while the internal registry
+resolves), **no tools, no credentials, no registry client**, and mounts the
+weights **read-only**. A successful injection has nothing to reach for. That is
+OWASP LLM06 by design rather than detection.
+
+Three smaller decisions worth noting:
+
+- **Input is rejected, output is redacted.** There is no safe way to sanitise an
+  adversarial prompt. But a leaked email in an otherwise useful answer should be
+  masked, not discarded — so PII is redacted and the request still works. Secrets
+  are the exception and block outright.
+- **False positives are a security property.** The suite asserts ordinary text
+  ("please ignore the noise in the data") is *not* blocked, and the card detector
+  runs a Luhn check. A guardrail that cries wolf gets switched off.
+- **Failures are opaque.** Rejections return categories, never the matched
+  pattern — otherwise the guardrail is a free oracle for tuning an attack. The
+  audit log follows the same rule and never records prompt text.
+
+The demo model is an untrained stub that emits gibberish. That is deliberate: the
+security scaffolding is the product, and guardrails act on text whether or not it
+is coherent.
+
 ## Threat coverage
 
 | OWASP LLM Top 10 (2025) | Control | Pillar |
 |---|---|---|
 | LLM03 Supply Chain | model scanning, signing, AIBOM, signed OCI registry, admission gate | 1, 2 ✅ |
 | LLM04 Data & Model Poisoning | provenance verification, safetensors, revision pinning, admission gate | 1, 2 ✅ |
-| LLM01 Prompt Injection | input guardrails + red-team gate | 3, 4 🚧 |
-| LLM02 Sensitive Info Disclosure | output PII/secret scanning + audit logging | 3, 5 🚧 |
-| LLM05 Improper Output Handling | output guardrails, schema enforcement | 3 🚧 |
-| LLM06 Excessive Agency | scoped RBAC, least privilege | 3 🚧 |
-| LLM07 System Prompt Leakage | prompt isolation + red-team probes | 3, 4 🚧 |
+| LLM01 Prompt Injection | input guardrail (weak) + egress lockdown bounding impact | 3 ⚠️ |
+| LLM02 Sensitive Info Disclosure | secret/PII detection both ways, PII-free audit log | 3 ✅ |
+| LLM05 Improper Output Handling | typed schema, output guardrail, no partial content | 3 ✅ |
+| LLM06 Excessive Agency | no egress, no tools, no credentials, read-only weights | 3 ✅ |
+| LLM07 System Prompt Leakage | Secret-supplied prompt + canary detection | 3 ⚠️ |
 | LLM09 Misinformation | grounding + promptfoo assertions | 4 🚧 |
-| LLM10 Unbounded Consumption | rate/token quotas + cost dashboards | 3, 5 🚧 |
+| LLM10 Unbounded Consumption | request + token quotas, input and generation caps | 3 ✅ |
 
 ## Layout
 
@@ -137,6 +190,6 @@ gitops/          app-of-apps + workloads reconciled by ArgoCD
 policies/        Pillar 2 — Kyverno admission policies
 examples/        compliant and deliberately non-compliant model-serving pods
 .github/         CI (lint, test, scan gate) and release (Trivy, cosign, SLSA)
-gateway/         Pillar 3 — FastAPI inference gateway
+gateway/         Pillar 3 — FastAPI gateway, guardrails, quotas
 redteam/         Pillar 4 — garak / promptfoo suites
 ```

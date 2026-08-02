@@ -21,19 +21,23 @@ dependencies = [
 # that runs as an init container on every serving pod needs neither, and keeping
 # them out of its image cuts it from ~2.5 GB to ~200 MB.
 build = ["torch>=2.3", "modelscan>=0.8"]
+# The serving gateway. Separate from `build` so the supply-chain tooling and the
+# runtime can be installed independently -- they run in different images with
+# different trust levels.
+serve = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "transformers>=4.44", "torch>=2.3"]
 
 [project.scripts]
 aegis = "supplychain.cli:app"
 
 [dependency-groups]
-dev = ["pytest>=8.2", "ruff>=0.5", "aegisllm[build]"]
+dev = ["pytest>=8.2", "ruff>=0.5", "httpx>=0.27", "aegisllm[build,serve]"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["supplychain"]
+packages = ["supplychain", "gateway"]
 
 [tool.ruff]
 line-length = 100

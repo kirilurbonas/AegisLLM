@@ -21,8 +21,17 @@ from .ingest import staged_root
 from .report import hash_manifest, read_report, stage, write_report
 
 PICKLE_SUFFIXES = {".bin", ".pt", ".pth", ".ckpt"}
+# transformers looks for `model.safetensors`; a file named after the pickle it
+# came from would load nowhere. Converting to the name the ecosystem expects is
+# what makes the secured artifact a drop-in replacement for the original.
+CANONICAL_WEIGHTS = {"pytorch_model": "model"}
 # Copied through untouched: config, tokenizer, model card.
 METADATA_SUFFIXES = {".json", ".txt", ".md", ".model"}
+
+
+def _safetensors_name(rel: pathlib.Path) -> pathlib.Path:
+    stem = CANONICAL_WEIGHTS.get(rel.stem, rel.stem)
+    return rel.with_name(f"{stem}.safetensors")
 
 
 def _torch():
@@ -53,6 +62,39 @@ def _load_checkpoint(path: pathlib.Path) -> dict[str, Any]:
     return {k: v for k, v in state.items() if isinstance(v, torch.Tensor)}
 
 
+def _materialise_shared_tensors(state: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Give every tensor its own storage.
+
+    Many architectures tie weights — GPT-2 points `lm_head.weight` at
+    `transformer.wte.weight`, sharing one buffer. safetensors is a flat mapping of
+    name to bytes with no way to express aliasing, so it refuses to save these.
+
+    The two ways out are to drop the duplicates and rely on the loader re-tying
+    them, or to clone so each name owns its bytes. This pipeline clones.
+    Dropping tensors makes the artifact depend on a loader faithfully
+    reconstructing what was removed, which is an assumption the signature cannot
+    cover: the bytes we sign would no longer be the whole model. Cloning costs
+    disk and keeps the guarantee that what was verified is what was published.
+    """
+    torch = _torch()
+    by_storage: dict[int, list[str]] = {}
+    for name, tensor in state.items():
+        if isinstance(tensor, torch.Tensor):
+            by_storage.setdefault(tensor.untyped_storage().data_ptr(), []).append(name)
+
+    shared = sorted(
+        name for names in by_storage.values() if len(names) > 1 for name in names
+    )
+    if not shared:
+        return state, []
+
+    materialised = {
+        name: (tensor.clone() if name in set(shared) else tensor)
+        for name, tensor in state.items()
+    }
+    return materialised, shared
+
+
 def _verify_equivalence(original: dict[str, Any], converted_path: pathlib.Path) -> None:
     from safetensors.torch import load_file as load_safetensors
 
@@ -79,6 +121,7 @@ def run(cfg: Settings) -> dict[str, Any]:
 
     converted: list[dict[str, Any]] = []
     passthrough: list[str] = []
+    superseded: list[str] = []
 
     for src in sorted(root.rglob("*")):
         if not src.is_file() or ".cache" in src.parts:
@@ -88,16 +131,33 @@ def run(cfg: Settings) -> dict[str, Any]:
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if src.suffix in PICKLE_SUFFIXES:
+            target_rel = _safetensors_name(rel)
+            # Many repos ship both a pickle checkpoint and a native safetensors
+            # copy of the same weights. Converting the pickle as well would
+            # publish the model twice and leave two things to keep in step.
+            # The native file is already the format we want, so prefer it.
+            if (root / target_rel).exists():
+                stage("convert", f"skipping {rel} — {target_rel} already ships natively")
+                superseded.append(str(rel))
+                continue
+
             tensors = _load_checkpoint(src)
-            target = dst.with_suffix(".safetensors")
-            # contiguous() because safetensors rejects non-contiguous views,
-            # which shared-storage checkpoints routinely contain.
+            tensors, shared = _materialise_shared_tensors(tensors)
+            if shared:
+                stage("convert", f"un-tied {len(shared)} shared tensor(s) in {rel}")
+            target = out / target_rel
+            # contiguous() because safetensors rejects non-contiguous views.
             from safetensors.torch import save_file
 
             save_file({k: v.contiguous() for k, v in tensors.items()}, str(target))
             _verify_equivalence(tensors, target)
             converted.append(
-                {"from": str(rel), "to": str(target.relative_to(out)), "tensors": len(tensors)}
+                {
+                    "from": str(rel),
+                    "to": str(target.relative_to(out)),
+                    "tensors": len(tensors),
+                    "untied_tensors": shared,
+                }
             )
             stage("convert", f"{rel} → {target.name} ({len(tensors)} tensors verified)")
         elif src.suffix in METADATA_SUFFIXES or src.suffix == ".safetensors":
@@ -112,6 +172,7 @@ def run(cfg: Settings) -> dict[str, Any]:
     report = {
         "converted": converted,
         "passthrough": passthrough,
+        "superseded_pickles": superseded,
         "secured_dir": str(out),
         "hashes": hash_manifest(out),
     }

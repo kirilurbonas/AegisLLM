@@ -1,8 +1,8 @@
 # Threat model
 
 Scope of this document: the model supply chain (Pillar 1), the platform
-foundation (Pillar 0), and the CI/CD and admission gate (Pillar 2) — the parts
-that exist. Runtime threats are listed
+foundation (Pillar 0), the CI/CD and admission gate (Pillar 2), and the runtime
+gateway (Pillar 3) — the parts that exist. Runtime threats are listed
 with their planned controls and marked as such — an unbuilt control is not a
 mitigation.
 
@@ -119,8 +119,68 @@ all capabilities dropped, and carries neither torch nor modelscan.
 cluster-admin who can edit ClusterPolicies can remove the gate entirely; Kyverno
 RBAC is the control there, and it is out of scope for this build.
 
-### T9 — Prompt injection, data leakage, unbounded consumption (**planned — Pillars 3–4**)
-No inference path exists yet, so these are out of scope for the current build.
+### T9 — Prompt injection (**partially mitigated**)
+An attacker crafts input that overrides the system prompt, hijacks the persona, or
+injects chat-template role markers.
+
+*Controls:* pattern-based input guardrail (instruction override, persona hijack,
+system-prompt extraction, role injection), refusing the request outright — there
+is no safe way to sanitise an adversarial prompt. Rejections return categories
+only, never the matched pattern, so the guardrail is not an oracle for tuning an
+attack.
+
+*Residual risk — stated plainly, because this is the control most often
+oversold:* **pattern matching does not stop a determined adversary.** Paraphrase,
+encoding, translation, and multi-turn splitting all defeat it. The regexes catch
+known shapes and casual attempts. What actually bounds the damage is T11 below.
+
+*Evidence:* `make demo-guardrails` against the deployed gateway; the must-not-fire
+tests in `tests/test_guardrails.py` guard against the false positives that get a
+guardrail switched off.
+
+### T10 — Sensitive data disclosure (**mitigated**)
+Secrets or personal data flow into the model, into logs, or back out in a response.
+
+*Controls:* secrets in a prompt are blocked (never reaching model or log); PII is
+redacted before the model sees it, so the request still works; output PII is
+redacted and output secrets block the response entirely with no partial content
+returned. The audit log records categories and counts, never prompt text — an
+audit trail full of PII is its own breach.
+
+*Evidence:* `test_the_model_never_sees_a_blocked_prompt`,
+`test_audit_summary_excludes_the_prompt_text`, `test_output_secrets_are_blocked_entirely`.
+
+### T11 — Excessive agency after a successful injection (**mitigated**)
+The assumption here is that T9 *will* eventually be bypassed. What can the model
+do then?
+
+*Controls, all architectural:* the gateway pod has no egress to the internet
+(NetworkPolicy, verified enforced on this cluster — a public-internet connect from
+inside the pod times out while the internal registry resolves); it has no tools,
+no credentials, and no registry client; `TRANSFORMERS_OFFLINE=1` with no oras or
+cosign in the image means it cannot fetch a model even if fully compromised; the
+model volume is mounted read-only so the component exposed to untrusted input
+cannot rewrite its own weights.
+
+*Residual risk:* NetworkPolicy is pod-scoped and init containers share the
+network namespace, so the registry must stay reachable for the pod's lifetime.
+Kubernetes cannot express "only the init container may egress"; an Istio
+authorization policy is the next step.
+
+### T12 — Unbounded consumption (**mitigated**)
+*Controls:* per-client request and token quotas in a sliding window, a hard input
+length cap, and a generation cap enforced in the backend regardless of what the
+caller requests. *Evidence:* verified live — request 61 of 60 returns 429.
+*Residual risk:* the window is per-process, so with N replicas the effective limit
+is N x the configured value. A real deployment moves it to Redis or the mesh; the
+code says so rather than implying a distributed quota.
+
+### T13 — System prompt leakage (**partially mitigated**)
+*Controls:* the system prompt is supplied from a Kubernetes Secret, not baked into
+the image or manifest; the output guardrail carries a canary fragment and blocks
+any response reproducing it verbatim.
+*Residual risk:* a paraphrased system prompt is not detected. Canary matching
+catches verbatim leakage only.
 
 ## OWASP LLM Top 10 (2025) coverage
 
@@ -128,14 +188,14 @@ No inference path exists yet, so these are out of scope for the current build.
 |---|---|---|
 | LLM03 Supply Chain | ✅ | T1–T7, plus the admission gate (T8) |
 | LLM04 Data & Model Poisoning | ✅ | revision pinning, provenance verification, safetensors, admission gate |
-| LLM01 Prompt Injection | 🚧 | input guardrails + red-team gate (Pillars 3–4) |
-| LLM02 Sensitive Info Disclosure | 🚧 | output scanning, audit log (Pillars 3, 5) |
-| LLM05 Improper Output Handling | 🚧 | output guardrails, schema enforcement (Pillar 3) |
-| LLM06 Excessive Agency | 🚧 | scoped RBAC, least privilege (Pillar 3) |
-| LLM07 System Prompt Leakage | 🚧 | prompt isolation, red-team probes (Pillars 3–4) |
+| LLM01 Prompt Injection | ⚠️ partial | input guardrail (weak); egress lockdown bounds impact (T9, T11) |
+| LLM02 Sensitive Info Disclosure | ✅ | secret/PII detection both directions, PII-free audit log (T10) |
+| LLM05 Improper Output Handling | ✅ | typed response schema, output guardrail, no partial content on block |
+| LLM06 Excessive Agency | ✅ | no egress, no tools, no credentials, read-only weights (T11) |
+| LLM07 System Prompt Leakage | ⚠️ partial | Secret-supplied prompt + canary detection; verbatim only (T13) |
 | LLM08 Vector/Embedding Weaknesses | 🚧 | RAG access controls (stretch) |
 | LLM09 Misinformation | 🚧 | grounding, promptfoo assertions (Pillar 4) |
-| LLM10 Unbounded Consumption | 🚧 | token quotas, cost alerts (Pillars 3, 5) |
+| LLM10 Unbounded Consumption | ✅ | request + token quotas, input and generation caps (T12) |
 
 ## MITRE ATLAS
 
@@ -144,8 +204,8 @@ No inference path exists yet, so these are out of scope for the current build.
 | AML.T0010 ML Supply Chain Compromise | ✅ | scan + sign + verify chain + admission gate |
 | AML.T0018 Backdoor ML Model | ✅ partial | provenance pinning detects substitution; a backdoor trained into the *original* weights is not detectable here |
 | AML.T0019 Publish Poisoned Datasets | ❌ | upstream of this platform |
-| AML.T0051 LLM Prompt Injection | 🚧 | Pillars 3–4 |
-| AML.T0057 LLM Data Leakage | 🚧 | Pillars 3, 5 |
+| AML.T0051 LLM Prompt Injection | ⚠️ partial | pattern guardrail + architectural containment |
+| AML.T0057 LLM Data Leakage | ✅ | output guardrails + egress lockdown |
 
 ## Known limitations
 
@@ -158,4 +218,11 @@ Stated plainly, because a threat model that only lists wins is marketing:
 - **`key` mode trusts a local key file.** See T7.
 - **Kyverno does not verify the model signature itself.** It enforces the pod
   shape; the init container does the cryptography. See T8.
-- **No runtime controls exist yet.** Pillars 3–5 are scaffolding, not mitigations.
+- **Prompt-injection detection is pattern-based and will be bypassed.** It is a
+  filter, not a defence. The architectural containment in T11 is what bounds the
+  blast radius, and it is the part worth trusting.
+- **The demo model is `sshleifer/tiny-gpt2`.** It is an untrained stub that emits
+  gibberish. That is deliberate — the security scaffolding is the product, and
+  the guardrails act on text regardless of whether it is coherent. No claim is
+  made about output quality.
+- **No red-teaming yet.** Pillars 4-5 are scaffolding, not mitigations.

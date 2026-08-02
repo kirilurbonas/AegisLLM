@@ -1,0 +1,168 @@
+# The runtime security gateway, deployed the only way this platform allows.
+#
+# The shape is the control:
+#
+#   1. `aegis-verify` runs first. It cosign-verifies the model manifest, pulls it,
+#      and verifies the model-signing bundle over the weight bytes. Any failure
+#      exits non-zero and the gateway container never starts.
+#   2. The gateway reads those weights from a shared emptyDir. It has no registry
+#      credentials, no oras, no cosign, and TRANSFORMERS_OFFLINE=1 -- it cannot
+#      fetch a model even if compromised.
+#   3. The model volume is mounted read-only into the gateway. The component
+#      exposed to untrusted input cannot rewrite the weights it was given.
+#
+# Substitute AEGIS_MODEL_REF at apply time -- see `make deploy-gateway`. In a real
+# GitOps flow the digest is committed here, and bumping a model is a reviewed pull
+# request rather than an imperative action.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-gateway
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-gateway
+    app.kubernetes.io/part-of: aegisllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-gateway
+  template:
+    metadata:
+      annotations:
+        aegis.dev/model: AEGIS_MODEL_REF
+      labels:
+        app.kubernetes.io/name: aegis-gateway
+        app.kubernetes.io/part-of: aegisllm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: aegis-verify
+          image: aegis-registry:5000/aegis-verifier:dev
+          args:
+            - verify-ref
+            - $(AEGIS_MODEL)
+            - --dest=/models
+            - --cosign-key=/keys/cosign.pub
+            - --model-key=/keys/aegis-signing.pub
+          env:
+            - name: AEGIS_MODEL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['aegis.dev/model']
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      containers:
+        - name: gateway
+          image: aegis-registry:5000/aegis-gateway:dev
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            # LLM10: the quotas that bound what a single caller can spend.
+            - { name: AEGIS_RPM, value: "60" }
+            - { name: AEGIS_TPM, value: "20000" }
+            - { name: AEGIS_MAX_INPUT_CHARS, value: "4000" }
+            - name: AEGIS_SYSTEM_PROMPT
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-system-prompt
+                  key: system-prompt
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Read-only: the gateway serves the weights, it does not own them.
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 2Gi }
+      volumes:
+        - { name: models, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+        - name: keys
+          secret:
+            secretName: aegis-public-keys
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-gateway
+  namespace: aegis
+spec:
+  selector:
+    app.kubernetes.io/name: aegis-gateway
+  ports:
+    - { name: http, port: 80, targetPort: 8000 }
+---
+# Egress lockdown for the gateway pod.
+#
+# This is the control that actually bounds a successful prompt injection. The
+# pattern matching in the guardrails is a filter and will eventually be talked
+# past; a model with no route to the internet has nowhere to exfiltrate to and no
+# tool to call. That is OWASP LLM06 (Excessive Agency) handled by architecture
+# rather than by detection -- and unlike the regexes, it does not degrade as the
+# attacker gets more creative.
+#
+# A caveat stated rather than glossed: NetworkPolicy applies to the *pod*, and
+# init containers share the pod's network namespace. The verifier needs the
+# registry, so the registry has to be reachable for the pod's whole lifetime.
+# Kubernetes cannot express "only the init container may egress". Narrowing this
+# further needs a service mesh with per-workload authorization policy (Istio),
+# which is the natural next step.
+#
+# Verified enforced on this cluster: an identical deny-all policy took a test pod
+# from HTTP 200 to no route. kindnet does honour NetworkPolicy here -- worth
+# checking on any cluster, because a silently-ignored policy is worse than none.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-gateway-egress-lockdown
+  namespace: aegis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The internal registry, for the verifier init container only. The CIDR is
+    # the kind docker network; a cloud deployment scopes this to the registry
+    # service address instead.
+    - to:
+        - ipBlock:
+            cidr: 172.18.0.0/16
+      ports:
+        - { protocol: TCP, port: 5000 }
+    # Everything else -- the public internet included -- is denied by omission.

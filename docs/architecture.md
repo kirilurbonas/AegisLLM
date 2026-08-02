@@ -1,6 +1,6 @@
 # AegisLLM architecture
 
-Five control planes over one pipeline. Pillars 0 and 1 are built; the rest are
+Five control planes over one pipeline. Pillars 0-3 are built; 4 and 5 are
 scaffolded and planned.
 
 ```
@@ -17,9 +17,9 @@ scaffolded and planned.
 └───────────────────────────────────┬──────────────────────────────────────────┘
                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  PILLAR 3: RUNTIME SECURITY GATEWAY           🚧 planned                      │
-│    FastAPI ─▶ input guardrails ─▶ vLLM/Ollama ─▶ output guardrails            │
-│    mTLS (Istio) · RBAC · Vault secrets · rate & token quotas                  │
+│  PILLAR 3: RUNTIME SECURITY GATEWAY           ✅ built                        │
+│    FastAPI ─▶ input guardrails ─▶ transformers ─▶ output guardrails           │
+│    egress lockdown · rate & token quotas · JSON audit trail                   │
 └───────────────────────────────────┬──────────────────────────────────────────┘
                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -150,6 +150,73 @@ when they are a protocol difference:
 bit both Kyverno and the verifier init container. containerd carries a
 `hosts.toml` for both names so either resolves to the same registry over plain
 HTTP.
+
+## Pillar 3 — design notes
+
+### What the guardrails are, and are not, worth
+
+Pattern-based prompt-injection detection is a **weak control**. It catches known
+phrasings and casual attempts. It does not stop a determined adversary, who can
+paraphrase, encode, translate, or split an instruction across turns. Shipping a
+regex list as "prompt injection protection" is how security theatre gets built.
+
+It is here for two honest reasons: defence in depth is still worth having, and
+Pillar 4's red-team suite needs a baseline to measure movement against.
+
+The control that actually bounds the damage is architectural, and it does not
+degrade as the attacker gets more creative:
+
+* the gateway has **no egress** to the internet (verified: a public-internet
+  connect from inside the pod times out, while the internal registry resolves);
+* it has **no tools, no credentials and no registry client** — a successful
+  injection has nothing to reach for;
+* `TRANSFORMERS_OFFLINE=1` and no oras/cosign in the image mean it **cannot
+  fetch a model** even if fully compromised.
+
+That is OWASP LLM06 (Excessive Agency) handled by design rather than detection.
+
+### Asymmetric decisions
+
+Input is **rejected**; output is **redacted** unless redaction is insufficient.
+
+There is no safe way to sanitise an adversarial prompt — stripping
+`ignore previous instructions` teaches the attacker to phrase it differently
+while telling the operator it was handled. Model output is different: a leaked
+email in an otherwise useful answer should be masked, not discarded. Secrets are
+the exception and are blocked outright, because a leaked credential means
+something already went wrong upstream.
+
+### False positives are a security property
+
+`tests/test_guardrails.py` asserts that ordinary text — "please ignore the noise
+in the data", "what instructions shipped with this washing machine" — is *not*
+blocked, and the payment-card detector runs a Luhn check so order numbers are not
+mistaken for cards. A guardrail that cries wolf gets switched off, and a switched-
+off guardrail protects nothing. The must-not-fire tests are load-bearing.
+
+### Failures are opaque
+
+A rejection returns categories (`prompt-injection:role-injection`), never the
+matching pattern. A detailed rejection reason is a free oracle for tuning an
+attack until it slips through. For the same reason the audit log records
+categories and counts, never prompt text — otherwise the audit trail becomes a
+store of exactly the sensitive data the PII guardrail exists to keep out of logs.
+
+### Conversion problems this pillar surfaced
+
+Serving a real generative model exposed two supply-chain bugs worth recording:
+
+* **Tied weights.** GPT-2 points `lm_head.weight` at `transformer.wte.weight` —
+  one buffer, two names — and safetensors, being a flat name-to-bytes mapping,
+  refuses to save it. The pipeline clones rather than dropping the duplicate:
+  dropping would make the artifact depend on a loader faithfully reconstructing
+  what was removed, and the bytes we sign would no longer be the whole model.
+* **File naming.** `transformers` looks for `model.safetensors`. Emitting
+  `pytorch_model.safetensors` produced an artifact that verified perfectly and
+  loaded nowhere. Converting to the canonical name is what makes the secured
+  model a drop-in replacement — and it revealed that repos shipping *both* a
+  pickle and a native safetensors were being published twice. The native file now
+  wins and the redundant pickle is recorded as superseded.
 
 ## Data flow
 

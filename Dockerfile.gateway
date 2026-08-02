@@ -1,0 +1,39 @@
+# The inference gateway.
+#
+# Separate from the verifier image on purpose. The verifier is the thing that
+# decides whether a model may be used, so it stays small and carries no ML
+# runtime. The gateway is the thing that *runs* the model, so it needs torch and
+# transformers. Keeping them apart means a CVE in the ML stack does not land in
+# the component making the trust decision, and the two can be signed, scanned,
+# and rolled independently.
+#
+# What this image deliberately does NOT contain: oras, cosign, or any registry
+# credentials. The gateway cannot fetch a model. It reads the volume the verifier
+# populated, or it refuses to start.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY gateway ./gateway
+COPY supplychain ./supplychain
+
+# CPU-only torch: this is a security demo on a laptop and a kind cluster, and the
+# CUDA wheels are gigabytes of attack surface for no benefit here.
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+        ".[serve]" \
+    && find /usr/local/lib/python3.12 -name '__pycache__' -prune -exec rm -rf {} + \
+    && rm -rf /root/.cache
+
+RUN useradd --uid 65532 --create-home --shell /usr/sbin/nologin aegis
+USER 65532
+
+# HF_HOME must point somewhere writable: transformers writes cache metadata even
+# for a purely local load, and the container runs with a read-only root.
+ENV HF_HOME=/tmp/hf \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1 \
+    AEGIS_MODEL_DIR=/models
+
+EXPOSE 8000
+ENTRYPOINT ["uvicorn", "gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]
