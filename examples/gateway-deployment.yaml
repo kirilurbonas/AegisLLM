@@ -32,7 +32,9 @@ metadata:
     app.kubernetes.io/name: aegis-gateway
     app.kubernetes.io/part-of: aegisllm
 spec:
-  replicas: 1
+  # Two replicas, so the shared quota is doing visible work rather than
+  # being a claim nobody exercises.
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: aegis-gateway
@@ -40,6 +42,17 @@ spec:
     metadata:
       annotations:
         aegis.dev/model: AEGIS_MODEL_REF
+        # The internal registry lives on the node network, outside the mesh, and
+        # speaks plain HTTP. Exclude it from sidecar interception.
+        #
+        # This became necessary when the Istio CNI plugin was adopted: the CNI
+        # installs the pod's traffic redirect at network-setup time, i.e. BEFORE
+        # init containers run. The verifier's pull was then redirected to a
+        # sidecar that had not started yet, and every pod died in
+        # Init:CrashLoopBackOff with a connection refused that looked like the
+        # registry was down. Scoped to the node CIDR, so pod-to-pod traffic
+        # (10.244.0.0/16) still goes through the mesh and keeps mTLS.
+        traffic.sidecar.istio.io/excludeOutboundIPRanges: "172.18.0.0/16"
       labels:
         app.kubernetes.io/name: aegis-gateway
         app.kubernetes.io/part-of: aegisllm
@@ -92,6 +105,10 @@ spec:
             - { name: AEGIS_RPM, value: "60" }
             - { name: AEGIS_TPM, value: "20000" }
             - { name: AEGIS_MAX_INPUT_CHARS, value: "4000" }
+            # Shared quota state: with this set the limits above are the
+            # cluster's, not each replica's. Unset, the gateway falls back to
+            # per-process counting and says so at startup.
+            - { name: AEGIS_REDIS_URL, value: "redis://aegis-redis.aegis.svc.cluster.local:6379/0" }
             - name: AEGIS_SYSTEM_PROMPT
               valueFrom:
                 secretKeyRef:
@@ -181,6 +198,16 @@ spec:
             cidr: 172.18.0.0/16
       ports:
         - { protocol: TCP, port: 5000 }
+    # The shared quota store. Without this the gateway cannot reach Redis, the
+    # limiter degrades to per-process counting, and the cluster-wide quota is
+    # quietly not a cluster-wide quota. It failed exactly that way the first time
+    # this policy met Redis -- caught only because the degradation is logged.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-redis
+      ports:
+        - { protocol: TCP, port: 6379 }
     # istiod, so the sidecar can fetch its workload certificate and policy. Without
     # this the pod joins the mesh and then fails to get an identity, which
     # presents as a confusing connection error rather than an obvious auth

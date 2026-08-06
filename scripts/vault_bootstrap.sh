@@ -40,26 +40,74 @@ done
 [ "${phase:-}" = "Running" ] || { echo "✗ $POD never reached Running"; exit 1; }
 
 # --- initialise ---------------------------------------------------------------
-if vault_exec vault status -format=json 2>/dev/null | grep -q '"initialized": true'; then
+#
+# Two rules here, both learned by breaking them:
+#
+#   1. Detect "already initialised" with a whitespace-tolerant match. `vault
+#      status -format=json` emits `"initialized": true` in some versions and
+#      `"initialized":true` in others; a literal grep silently decided a healthy
+#      Vault was uninitialised.
+#   2. NEVER redirect straight into $INIT_FILE. `>` truncates before the command
+#      runs, so a failed `operator init` against an already-initialised Vault
+#      wiped the unseal keys — permanently sealing a Vault whose shares existed
+#      nowhere else. Write to a temp file and move it into place only on success.
+vault_status() { vault_exec vault status -format=json 2>/dev/null || true; }
+
+is_initialised() {
+  vault_status | grep -Eq '"initialized"[[:space:]]*:[[:space:]]*true'
+}
+
+is_unsealed() {
+  vault_status | grep -Eq '"sealed"[[:space:]]*:[[:space:]]*false'
+}
+
+if is_initialised; then
   log "already initialised"
+  if [ ! -s "$INIT_FILE" ]; then
+    cat >&2 <<'MSG'
+✗ Vault is initialised but the unseal material is missing or empty.
+
+  Its keys exist nowhere else, so this Vault cannot be unsealed again. For a
+  local dev cluster the recovery is to destroy its storage and start over:
+
+      kubectl -n vault delete pvc data-vault-0
+      kubectl -n vault delete pod vault-0
+      make vault
+
+  Anything previously signed with the old Transit key will need re-signing.
+MSG
+    exit 1
+  fi
 else
   log "initialising (3 shares, threshold 2)"
   mkdir -p "$(dirname "$INIT_FILE")"
-  vault_exec vault operator init -key-shares=3 -key-threshold=2 -format=json > "$INIT_FILE"
+  tmp_init="$(mktemp)"
+  if ! vault_exec vault operator init -key-shares=3 -key-threshold=2 -format=json > "$tmp_init"; then
+    rm -f "$tmp_init"
+    echo "✗ vault operator init failed; $INIT_FILE left untouched" >&2
+    exit 1
+  fi
+  # Only now is it safe to touch the real file.
+  mv "$tmp_init" "$INIT_FILE"
   chmod 600 "$INIT_FILE"
   log "unseal material written to $INIT_FILE (gitignored)"
 fi
 
-[ -f "$INIT_FILE" ] || { echo "✗ $INIT_FILE missing and Vault is already initialised."; exit 1; }
-
 # --- unseal -------------------------------------------------------------------
-if vault_exec vault status -format=json 2>/dev/null | grep -q '"sealed": false'; then
+if is_unsealed; then
   log "already unsealed"
 else
   log "unsealing"
-  jq -r '.unseal_keys_b64[0:2][]' "$INIT_FILE" | while read -r key; do
-    vault_exec vault operator unseal "$key" >/dev/null
+  # Read the shares into a variable first, and give each `kubectl exec` its own
+  # stdin. Piping jq into `while read` looks natural and does not work here:
+  # `kubectl exec -i` inherits the loop's stdin and drains the remaining keys, so
+  # exactly one share is ever submitted and Vault stays sealed at threshold 2 --
+  # with the script cheerfully reporting success.
+  shares=$(jq -r '.unseal_keys_b64[0:2][]' "$INIT_FILE")
+  for key in $shares; do
+    kubectl -n "$NS" exec "$POD" -- vault operator unseal "$key" >/dev/null </dev/null
   done
+  is_unsealed || { echo "✗ Vault is still sealed after submitting shares" >&2; exit 1; }
 fi
 
 ROOT_TOKEN=$(jq -r .root_token "$INIT_FILE")

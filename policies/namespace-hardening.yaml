@@ -1,0 +1,97 @@
+# Namespace-level guardrails, enforced by Kubernetes itself.
+#
+# These are the controls that do not depend on anyone remembering to write them
+# into a workload manifest. The gateway already drops capabilities and runs
+# unprivileged; this makes those properties a rule of the namespace rather than a
+# habit of one deployment.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis
+  labels:
+    # Pod Security Admission at the strictest built-in level: no privilege
+    # escalation, no host namespaces, non-root, seccomp, capabilities dropped.
+    # `enforce` rejects violations outright; `audit` and `warn` make it visible
+    # when something would have been rejected under a future upgrade.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Bound the blast radius of a runaway or malicious workload.
+#
+# Without a quota, one pod requesting 32Gi is a denial of service against every
+# other tenant of the node — and an LLM workload is exactly the kind of thing
+# that asks for a lot of memory in good faith.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: aegis-quota
+  namespace: aegis
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 6Gi
+    limits.memory: 8Gi
+    pods: "20"
+---
+# Every container gets a memory limit whether or not its author wrote one. A pod
+# with no limit is the one that evicts its neighbours under pressure.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: aegis-defaults
+  namespace: aegis
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: 512Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 128Mi
+---
+# Ingress lockdown: the gateway accepts traffic from the mesh, and nothing else.
+#
+# The egress side was already closed (see the gateway deployment). This closes the
+# other direction: without it, any pod in the cluster that can reach the pod IP
+# gets a TCP connection to the model service, and the only thing standing in the
+# way is the Istio sidecar. Defence in depth means not relying on a single
+# component to be correctly configured and running.
+#
+# Note this is a *network* control and the mesh policies are an *identity*
+# control. They overlap deliberately: NetworkPolicy says which pods may connect,
+# AuthorizationPolicy says which identities may be served, and each one covers a
+# failure of the other.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-gateway-ingress
+  namespace: aegis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-gateway
+  policyTypes: [Ingress]
+  ingress:
+    # Callers inside the namespace — which, with STRICT mTLS, means callers that
+    # hold a mesh identity.
+    - from:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: 8000 }
+        - { protocol: TCP, port: 15020 }
+    # istiod and the mesh control plane.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+    # Kubelet probes arrive from the node itself, not from a pod, so they match
+    # no podSelector. Without this the readiness probe fails and the Deployment
+    # never becomes available — a failure that looks like a broken app.
+    - from:
+        - ipBlock:
+            cidr: 172.18.0.0/16
+      ports:
+        - { protocol: TCP, port: 8000 }
+        - { protocol: TCP, port: 15021 }

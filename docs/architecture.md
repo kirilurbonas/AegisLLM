@@ -278,6 +278,59 @@ A second rule checks the verifier's image separately, via a conditional anchor
 that scopes it to that container. Presence alone would be satisfied by a busybox
 named `aegis-verify` doing nothing at all.
 
+## Platform hardening — three failures worth keeping
+
+Each of these is a control that only proved real by breaking something.
+
+### Pod Security Admission vs the service mesh
+
+`restricted` rejects containers that need NET_ADMIN or run as root. Istio's
+classic sidecar injection adds exactly such an init container (`istio-init`) to
+set up iptables — so enabling PSA broke every mesh-injected pod in the namespace.
+
+The fix is the **Istio CNI plugin**, which moves that setup into a node-level
+DaemonSet; the injected init container becomes the unprivileged
+`istio-validation`. Installing the CNI chart is only half of it: istiod keeps
+injecting the privileged container until told the CNI exists, and the key is
+`pilot.cni.enabled`. The widely-copied `istio_cni.enabled` is silently ignored by
+this chart — the install succeeds and nothing changes, which is the worst kind of
+configuration error.
+
+Adopting the CNI then broke the *verifier*. The CNI installs the pod's traffic
+redirect at network-setup time, before init containers run, so the verifier's
+registry pull was redirected to a sidecar that had not started. Every pod died in
+`Init:CrashLoopBackOff` with a connection-refused that looked like the registry
+was down. Excluding the node CIDR from interception
+(`traffic.sidecar.istio.io/excludeOutboundIPRanges`) fixes it while leaving
+pod-to-pod traffic inside the mesh with mTLS intact.
+
+### Deny-by-default finds your undeclared dependencies
+
+Adding Redis, the gateway quietly fell back to per-process counting. Three
+separate causes, in order:
+
+1. the egress `NetworkPolicy` had no rule for Redis;
+2. a 250 ms connect timeout — chosen to look appropriately strict — was too tight
+   for a first connection through an mTLS sidecar;
+3. the `aegis-deny-all` `AuthorizationPolicy` refused gateway→Redis, because no
+   rule authorised it.
+
+Only the third is really a "failure": the other two are ordinary bugs. The third
+is deny-by-default doing its job, and the cost of that posture is exactly this —
+every new dependency must be declared. That is the trade, and it is worth taking.
+
+All three presented identically: connection errors that looked like Redis being
+down. They were found because the limiter **logs its degradation** instead of
+silently weakening. A fallback that fails quietly would have left a "cluster-wide"
+quota that was nothing of the kind, and the tests would still have passed.
+
+### Why the quota check is a Lua script
+
+The whole read-decide-write runs inside Redis atomically. Split into separate
+round trips, two replicas can both observe "59 used" and both allow one more —
+the race that makes a distributed quota leak under exactly the load it exists to
+control.
+
 ## Data flow
 
 ```

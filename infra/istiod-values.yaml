@@ -1,6 +1,21 @@
 # Trimmed for an 8 GB Docker VM: one istiod replica, modest requests, and the
 # sidecar injector limited to namespaces that opt in by label.
+# The Istio CNI plugin performs the pod's iptables setup from a node-level
+# DaemonSet. Without it, istiod injects an `istio-init` container that needs
+# NET_ADMIN, NET_RAW and root -- which Pod Security Admission `restricted`
+# rejects outright. Installing the CNI chart alone is not enough: istiod has to
+# be told it exists, or it keeps injecting the privileged init container.
 pilot:
+  # Tell istiod the CNI plugin is handling iptables. Without this it keeps
+  # injecting `istio-init`, which needs NET_ADMIN, NET_RAW and root -- rejected
+  # outright by Pod Security Admission `restricted`. Installing the CNI chart is
+  # only half the job; the injector has to know.
+  #
+  # The key lives at `pilot.cni.enabled` in this chart. `istio_cni.enabled`,
+  # which appears in a lot of older material, is silently ignored here — the
+  # install succeeds and the privileged init container keeps appearing.
+  cni:
+    enabled: true
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 640Mi}

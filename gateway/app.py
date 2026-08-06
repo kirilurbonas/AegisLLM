@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from . import auth
 from .guardrails import GuardrailConfig, InputGuardrail, OutputGuardrail
-from .limits import RateLimiter
+from .limits import build_limiter
 from .model import ModelBackend, load_backend
 
 LOG = logging.getLogger("aegis.gateway")
@@ -52,7 +52,8 @@ config = GuardrailConfig(
 
 input_guardrail = InputGuardrail(config)
 output_guardrail = OutputGuardrail(config, system_prompt=SYSTEM_PROMPT)
-rate_limiter = RateLimiter(
+# Cluster-wide when AEGIS_REDIS_URL is set, per-process otherwise.
+rate_limiter = build_limiter(
     requests_per_minute=int(os.getenv("AEGIS_RPM", "60")),
     tokens_per_minute=int(os.getenv("AEGIS_TPM", "20000")),
 )
@@ -72,7 +73,10 @@ async def lifespan(_app: FastAPI):
     global _backend
     _backend = load_backend(MODEL_DIR)
     LOG.info(
-        '{"event":"startup","model_dir":"%s","backend":"%s"}', MODEL_DIR, _backend.kind
+        '{"event":"startup","model_dir":"%s","backend":"%s","quota_backend":"%s"}',
+        MODEL_DIR,
+        _backend.kind,
+        rate_limiter.kind,
     )
     yield
 

@@ -24,7 +24,7 @@ build = ["torch>=2.3", "modelscan>=0.8"]
 # The serving gateway. Separate from `build` so the supply-chain tooling and the
 # runtime can be installed independently -- they run in different images with
 # different trust levels.
-serve = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "transformers>=4.44", "torch>=2.3"]
+serve = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "transformers>=4.44", "torch>=2.3", "redis>=5.0"]
 
 [project.scripts]
 aegis = "supplychain.cli:app"

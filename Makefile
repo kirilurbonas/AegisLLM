@@ -259,8 +259,18 @@ gateway-secret: ## Store the system prompt as a Secret, not in the manifest
 		--from-literal=system-prompt="You are AegisLLM, an assistant operating under strict security policy. Canary: AEGIS-SYSTEM-PROMPT-DO-NOT-REVEAL." \
 		--dry-run=client -o yaml | kubectl apply -f -
 
+.PHONY: harden
+harden: ## Apply namespace hardening: PSA restricted, quotas, ingress lockdown
+	kubectl apply -f policies/namespace-hardening.yaml
+	@kubectl get ns aegis -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep pod-security || true
+
+.PHONY: redis
+redis: ## Deploy the shared quota store
+	kubectl apply -f examples/redis.yaml
+	kubectl -n aegis rollout status deploy/aegis-redis --timeout=180s
+
 .PHONY: deploy-gateway
-deploy-gateway: gateway-secret ## Deploy the guardrailed gateway over a verified model
+deploy-gateway: gateway-secret redis ## Deploy the guardrailed gateway over a verified model
 	@test -n "$(GEN_MODEL_DIGEST)" || { \
 		echo "✗ no published generative model — run:"; \
 		echo "    AEGIS_MODEL_ID=sshleifer/tiny-gpt2 uv run aegis all"; exit 1; }

@@ -1,0 +1,62 @@
+# Shared quota state, so the configured limit is the cluster's and not each
+# replica's. Deliberately unglamorous: one replica, no persistence, 64Mi.
+#
+# Quota counters are ephemeral by nature — losing them on restart means callers
+# briefly get a fresh budget, which is a far smaller problem than the complexity
+# of running a replicated stateful store to protect a 60-second sliding window.
+# Sizing this like a database would be cargo-culting durability it does not need.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-redis
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-redis
+    app.kubernetes.io/part-of: aegisllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aegis-redis
+        app.kubernetes.io/part-of: aegisllm
+        sidecar.istio.io/inject: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "48mb",
+                 "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            tcpSocket: { port: redis }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-redis
+  namespace: aegis
+spec:
+  selector:
+    app.kubernetes.io/name: aegis-redis
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }

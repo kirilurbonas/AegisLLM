@@ -25,6 +25,14 @@ metadata:
 spec:
   serviceAccountName: aegis-test-client
   restartPolicy: Never
+  # Pod-level so the mesh-injected containers inherit it too: Pod Security
+  # Admission `restricted` requires a seccomp profile on *every* container, and
+  # istio-proxy and istio-validation are added after this manifest is written.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: curl
       image: curlimages/curl:8.10.1

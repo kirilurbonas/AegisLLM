@@ -227,11 +227,40 @@ authorization policy is the next step.
 *Controls:* per-client request and token quotas in a sliding window, a hard input
 length cap, and a generation cap enforced in the backend regardless of what the
 caller requests. *Evidence:* verified live — request 61 of 60 returns 429.
-*Residual risk:* the window is per-process, so with N replicas the effective limit
-is N x the configured value. Quotas are now at least *correctly attributed* to a
-verified identity (T14), which is the part that was actually broken; making the
-window cluster-wide needs Redis or an Envoy global rate-limit service and is not
-yet done. The code says so rather than implying a distributed quota.
+*Now cluster-wide.* The sliding window lives in Redis and the whole
+check-and-record runs as one Lua script, so it is atomic: split across separate
+reads and writes, two replicas could each observe the same count and each decide
+there was room. Verified on two replicas with a limit of 60/min — 70 requests
+produce exactly 60 × 200 and 10 × 429. Before this, the same test returned 70 ×
+200, which is the `replicas x limit` bug in one line.
+
+*Residual risk, and it is a deliberate trade:* if Redis is unreachable the limiter
+degrades to per-process counting rather than refusing traffic. During an outage
+the effective limit rises to `replicas x limit`. Failing closed would turn a Redis
+blip into a full outage of the model service, which is the wrong trade for a
+control whose job is bounding cost and abuse rather than acting as a safety
+interlock. The degradation is logged once (not per request) and is an operational
+signal — it is how two real misconfigurations in this cluster were caught.
+
+### T15 — Workload escape and noisy neighbours (**mitigated**)
+A compromised or simply badly-behaved pod in the namespace escalating privileges,
+or starving its neighbours.
+
+*Controls:* Pod Security Admission `restricted` is enforced on the `aegis`
+namespace — non-root, no privilege escalation, all capabilities dropped, seccomp
+required, on every container including injected sidecars. A `ResourceQuota` caps
+the namespace and a `LimitRange` gives every container a memory limit whether or
+not its author wrote one. An ingress `NetworkPolicy` means only mesh callers and
+kubelet probes can open a connection to the gateway at all, so the identity layer
+is not the single thing standing between an arbitrary pod and the model.
+
+*Evidence:* enforcement is real, not declarative — `restricted` rejected the
+project's own test-client manifest until it declared `runAsNonRoot` and a seccomp
+profile, and rejected every Istio-injected pod until the CNI plugin removed the
+privileged `istio-init` container.
+
+*Residual risk:* PSA is namespace-scoped. Cluster-wide enforcement, and policy for
+the namespaces Istio and Vault run in, is not addressed here.
 
 ### T13 — System prompt leakage (**partially mitigated**)
 *Controls:* the system prompt is supplied from a Kubernetes Secret, not baked into

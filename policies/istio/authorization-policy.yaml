@@ -49,3 +49,30 @@ spec:
         - operation:
             methods: ["GET"]
             paths: ["/healthz", "/readyz"]
+---
+# The gateway may call the quota store, and nothing else may.
+#
+# This rule exists because `aegis-deny-all` above did its job. Adding Redis, the
+# gateway silently fell back to per-process counting: the connection was refused
+# by mesh authorization, not by the network, so it looked like Redis was down.
+# Deny-by-default means every new dependency has to be declared — which is the
+# entire point, and also the part that costs you an afternoon the first time.
+#
+# Scoped to the gateway's SPIFFE identity rather than "anything in the namespace":
+# a compromised sidecar-injected pod should not be able to read or poison other
+# tenants' quota counters.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: aegis-redis-callers
+  namespace: aegis
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-redis
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/aegis/sa/aegis-gateway

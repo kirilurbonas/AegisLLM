@@ -224,6 +224,34 @@ It is now a count-based `deny` selecting by name, plus a separate rule asserting
 the verifier image is the real one (presence alone would be satisfied by a busybox
 doing nothing). Both cases are locked in as policy tests.
 
+### Hardening: quotas that mean what they say
+
+The limit was per-process, so with N replicas the real limit was `N x limit`.
+Now the sliding window lives in Redis, evaluated as one atomic Lua script:
+
+```
+70 requests · limit 60/min · 2 replicas
+  before:  70 × 200          ← replicas x limit
+  after:   60 × 200, 10 × 429
+```
+
+Plus Pod Security Admission `restricted` on the namespace, a ResourceQuota, a
+LimitRange, and an ingress NetworkPolicy so the identity layer is not the only
+thing between an arbitrary pod and the model.
+
+Three things broke on the way, and all three are documented in
+[docs/architecture.md](docs/architecture.md) because the failure modes are the
+interesting part: PSA rejects Istio's privileged init container (fixed with the
+Istio CNI plugin — and the widely-copied `istio_cni.enabled` key is silently
+ignored, it is `pilot.cni.enabled`); the CNI then broke the verifier by
+redirecting init-container traffic to a sidecar that had not started; and
+deny-by-default authorization refused gateway→Redis until it was declared.
+
+All three looked like "Redis is down". They were caught only because the limiter
+**logs when it degrades** rather than silently falling back — a quiet fallback
+would have left a cluster-wide quota that was nothing of the kind, with every
+test still passing.
+
 ## Threat coverage
 
 | OWASP LLM Top 10 (2025) | Control | Pillar |
@@ -236,7 +264,7 @@ doing nothing). Both cases are locked in as policy tests.
 | LLM06 Excessive Agency | no egress, no tools, no credentials, read-only weights | 3 ✅ |
 | LLM07 System Prompt Leakage | Secret-supplied prompt + canary detection | 3 ⚠️ |
 | LLM09 Misinformation | grounding + promptfoo assertions | 4 🚧 |
-| LLM10 Unbounded Consumption | request + token quotas, input and generation caps | 3 ✅ |
+| LLM10 Unbounded Consumption | cluster-wide request + token quotas, input and generation caps | 3 ✅ |
 
 ## Layout
 
